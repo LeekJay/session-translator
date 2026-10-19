@@ -7,7 +7,7 @@ Claude Code mod。把提示翻译成模型语言，把助手回复翻译成你�
 GitHub：
 
 ```
-/plugin install session-translator --marketplace <owner>/<repo>
+/plugin install session-translator --marketplace LeekJay/session-translator
 ```
 
 自建 Git（Gitea 等）：
