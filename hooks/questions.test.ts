@@ -1,7 +1,9 @@
 import { expect, test } from 'claude-code/testing'
 import {
   MAX_HEADER_LENGTH,
+  buildAnswersRequest,
   buildQuestionsRequest,
+  freeTextAnswers,
   parseQuestionsResponse,
   questionTexts,
   rewriteQuestions,
@@ -87,6 +89,73 @@ test('答案映射回原问题文本与英文标签', {}, async () => {
   })
   expect(back.annotations).toEqual({ 'Which library should we use?': '备注' })
   expect(back.response).toBe('自由输入')
+})
+
+test('收集用户手输的自由答案，跳过选项标签', {}, async () => {
+  const translated = rewriteQuestions(QUESTIONS, [
+    '用哪个测试库？',
+    '测试库',
+    '维特',
+    '快。',
+    '杰斯特',
+    '常用。',
+  ]) as unknown[]
+
+  const result = {
+    questions: translated,
+    answers: {
+      '用哪个测试库？': '维特',
+      'Which OS?': '我在 Windows 上开发，顺便看看 Linux',
+    },
+    annotations: { '用哪个测试库？': '再想想' },
+    response: '能不能只用标准库？',
+  }
+
+  expect(freeTextAnswers(result, QUESTIONS, translated)).toEqual([
+    '我在 Windows 上开发，顺便看看 Linux',
+    '再想想',
+    '能不能只用标准库？',
+  ])
+})
+
+test('自由答案按整串翻译回填，不拆逗号', {}, async () => {
+  const translated = rewriteQuestions(QUESTIONS, [
+    '用哪个测试库？',
+    '测试库',
+    '维特',
+    '快。',
+    '杰斯特',
+    '常用。',
+  ]) as unknown[]
+
+  const source = '我在 Windows 上开发，顺便看看 Linux'
+  const target = 'I develop on Windows, and also want to check Linux'
+
+  const result = {
+    questions: translated,
+    answers: { '用哪个测试库？': '维特, 我在 Windows 上开发，顺便看看 Linux' },
+    response: source,
+  }
+
+  const back = translateAnswers(
+    result,
+    QUESTIONS,
+    translated,
+    new Map([[source, target]]),
+  ) as Record<string, unknown>
+
+  expect(back.answers).toEqual({
+    'Which library should we use?': `Vitest, ${target}`,
+  })
+  expect(back.response).toBe(target)
+})
+
+test('答案请求要求严格 JSON 且不限制长度', {}, async () => {
+  const request = buildAnswersRequest(['我在 Windows 上开发'], 'en', '')
+  expect(request.prompt).toBe('["我在 Windows 上开发"]')
+  expect(request.system).toContain('English')
+  expect(request.system).toContain('{"translations":[...]}')
+  expect(request.system).not.toContain('at most')
 })
 
 test('译文数量对不上时不改写', {}, async () => {

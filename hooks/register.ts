@@ -11,9 +11,15 @@ import type {
   TranslationCacheEntry,
   TranslationLanguage,
 } from '../types'
-import { isTranslationLanguage, languageName } from './languages'
 import {
+  isTranslationLanguage,
+  isUsableTranslation,
+  languageName,
+} from './languages'
+import {
+  buildAnswersRequest,
   buildQuestionsRequest,
+  freeTextAnswers,
   parseQuestionsResponse,
   questionTexts,
   rewriteQuestions,
@@ -391,6 +397,53 @@ async function translateQuestions(
     const reason = error instanceof Error ? error.message : 'unknown-error'
     return { status: 'failed', reason }
   }
+}
+
+/**
+ * 用户手输的答案：选择对话框里选的是译好的中文标签，但输入框里打的是中文
+ * 自由文本。回传前把这段自由文本送进模型翻成模型语言，翻不动就保留原文。
+ * 逐条判语言，已经是模型语言的直接跳过。
+ */
+async function translateFreeTextAnswers(
+  $: EngineInterface,
+  texts: readonly string[],
+  target: TranslationLanguage,
+  translationRules: string,
+  model: string,
+): Promise<Map<string, string>> {
+  const map = new Map<string, string>()
+  if (texts.length === 0) return map
+
+  const pendingTexts = texts.filter(text =>
+    shouldTranslate(text, target, translationRules),
+  )
+  if (pendingTexts.length === 0) return map
+
+  try {
+    const request = buildAnswersRequest(pendingTexts, target, translationRules)
+    const result = await $.model.complete({
+      model,
+      prompt: request.prompt,
+      system: request.system,
+      maxTokens: request.maxTokens,
+      effort: 'low',
+    })
+    if (!result.isAnswered) return map
+
+    const translations = parseQuestionsResponse(result.text)
+    if (translations === undefined) return map
+    if (translations.length !== pendingTexts.length) return map
+
+    for (let index = 0; index < pendingTexts.length; index += 1) {
+      const source = pendingTexts[index]!
+      const translated = translations[index]!
+      if (isUsableTranslation(translated, target)) map.set(source, translated)
+    }
+  } catch {
+    // 翻不动就让模型读原文，比丢掉答案安全。
+  }
+
+  return map
 }
 
 async function commit(
@@ -801,9 +854,21 @@ export const register: Register = (on, options) => {
     if (!('result' in result) || result.result === undefined) return result
 
     try {
+      const freeText = await translateFreeTextAnswers(
+        $,
+        freeTextAnswers(result.result, e.questions, translatedQuestions),
+        runtime.config.inputLanguage,
+        runtime.config.translationRules,
+        runtime.config.model,
+      )
       return {
         ...result,
-        result: translateAnswers(result.result, e.questions, translatedQuestions),
+        result: translateAnswers(
+          result.result,
+          e.questions,
+          translatedQuestions,
+          freeText,
+        ),
       }
     } catch {
       // 还原失败时宁可让模型看到译文，也不重复执行工具。

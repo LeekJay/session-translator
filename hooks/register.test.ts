@@ -27,12 +27,12 @@ function answered(text: string) {
 
 function installModel(
   on: On,
-  respond: (source: string) => string,
+  respond: (source: string, system: string) => string,
 ): () => number {
   let calls = 0
   on('model.complete', ($, e) => {
     calls += 1
-    return { value: answered(respond(extractSource(e.prompt))) }
+    return { value: answered(respond(extractSource(e.prompt), e.system ?? '')) }
   })
   return () => calls
 }
@@ -362,6 +362,127 @@ test(
 
     await $.tool.call({ tool: 'AskUserQuestion', questions })
     expect(calls()).toBe(1)
+  },
+)
+
+test(
+  '选择对话框里手输的中文答案翻成英文再回传模型',
+  { options: { translateOutput: true, outputLanguage: 'zh', inputLanguage: 'en' } },
+  async ($, on) => {
+    const clock = mock.clock(on)
+
+    on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
+      return {
+        result: {
+          questions: e.questions,
+          answers: {
+            '用哪个库？': '甲, 我在 Windows 上开发',
+          },
+          response: '能不能只用标准库？',
+        },
+      }
+    })
+
+    const prompts: string[] = []
+    on('model.complete', ($, e) => {
+      prompts.push(e.prompt)
+      if ((e.system ?? '').includes('answers a person typed')) {
+        const texts = JSON.parse(e.prompt) as string[]
+        return {
+          value: answered(
+            JSON.stringify({
+              translations: texts.map(text =>
+                text === '我在 Windows 上开发'
+                  ? 'I develop on Windows'
+                  : 'Can it use only the standard library?',
+              ),
+            }),
+          ),
+        }
+      }
+      return {
+        value: answered(
+          '{"translations":["用哪个库？","库","甲","第一个选项。","乙","第二个选项。"]}',
+        ),
+      }
+    })
+
+    const questions = [
+      {
+        question: 'Which library?',
+        header: 'Library',
+        multiSelect: false,
+        options: [
+          { label: 'Alpha', description: 'First option.' },
+          { label: 'Beta', description: 'Second option.' },
+        ],
+      },
+    ]
+
+    const response = await $.tool.call({ tool: 'AskUserQuestion', questions })
+    const result = (response as { result: Record<string, unknown> }).result
+
+    expect(prompts.length).toBe(2)
+    expect(prompts[1]).toContain('我在 Windows 上开发')
+    expect(result.answers).toEqual({
+      'Which library?': 'Alpha, I develop on Windows',
+    })
+    expect(result.response).toBe(
+      'Can it use only the standard library?',
+    )
+
+    await clock.advance(1)
+    await clock.settle()
+  },
+)
+
+test(
+  '手输答案翻译失败时保留原文',
+  { options: { translateOutput: true, outputLanguage: 'zh', inputLanguage: 'en' } },
+  async ($, on) => {
+    const clock = mock.clock(on)
+
+    on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
+      return {
+        result: {
+          questions: e.questions,
+          answers: { '用哪个库？': '甲' },
+          response: '随便写点什么',
+        },
+      }
+    })
+
+    on('model.complete', ($, e) => {
+      if ((e.system ?? '').includes('answers a person typed')) {
+        return { value: answered('not json') }
+      }
+      return {
+        value: answered(
+          '{"translations":["用哪个库？","库","甲","第一个选项。","乙","第二个选项。"]}',
+        ),
+      }
+    })
+
+    const questions = [
+      {
+        question: 'Which library?',
+        header: 'Library',
+        multiSelect: false,
+        options: [
+          { label: 'Alpha', description: 'First option.' },
+          { label: 'Beta', description: 'Second option.' },
+        ],
+      },
+    ]
+
+    const response = await $.tool.call({ tool: 'AskUserQuestion', questions })
+    const result = (response as { result: Record<string, unknown> }).result
+
+    expect(result.answers).toEqual({ 'Which library?': 'Alpha' })
+    expect(result.response).toBe('随便写点什么')
+
+    await clock.advance(1)
+    await clock.settle()
   },
 )
 
