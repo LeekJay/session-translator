@@ -1,0 +1,47 @@
+{
+  "name": "session-translator",
+  "version": "0.1.0",
+  "description": "把提示翻译成模型语言，把回复翻译成你的语言；只改显示，不改存储的会话记录。",
+  "author": { "name": "LeekJay" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "translateInput": {
+      "type": "boolean",
+      "title": "翻译提示",
+      "description": "提交前把你写的内容翻译成模型语言。",
+      "default": true
+    },
+    "inputLanguage": {
+      "type": "string",
+      "title": "模型语言",
+      "description": "提示被翻译成的语言。",
+      "default": "en",
+      "options": ["en", "zh", "ja", "fr", "de"]
+    },
+    "translateOutput": {
+      "type": "boolean",
+      "title": "翻译回复",
+      "description": "把助手回复翻译成你的语言，仅改变显示。",
+      "default": true
+    },
+    "outputLanguage": {
+      "type": "string",
+      "title": "你的语言",
+      "description": "回复被翻译成的语言。",
+      "default": "zh",
+      "options": ["en", "zh", "ja", "fr", "de"]
+    },
+    "model": {
+      "type": "string",
+      "title": "翻译模型",
+      "description": "一个模型别名或完整 id。默认 haiku。",
+      "default": "haiku"
+    },
+    "translationRules": {
+      "type": "string",
+      "title": "自定义翻译规则",
+      "description": "每行一条，优先级高于默认规则。留空表示不使用。",
+      "default": ""
+    }
+  }
+}

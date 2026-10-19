@@ -1,0 +1,6 @@
+{
+  "name": "session-translator",
+  "description": "Claude Code 会话翻译 mod：提示进入前翻译，回复只在显示时翻译。",
+  "owner": { "name": "LeekJay" },
+  "plugins": [{ "name": "session-translator", "source": "./" }]
+}
