@@ -487,56 +487,88 @@ test(
 )
 
 test(
-  'goal 的目标条件翻成英文挂在输出行之后，参数本身不改',
+  'goal 设置后给模型的目标提示行里，条件换成译文',
   { options: { translateInput: true, inputLanguage: 'en' } },
   async ($, on) => {
-    let reached = ''
     const calls = installModel(on, () => translated('Fix the login problem'))
-    on('command.run', { command: 'goal' }, ($, e) => {
-      reached = e.args
-      return { text: 'Goal set: 修好登录问题' }
+    const ack =
+      'A session-scoped Stop hook is now active with condition: "修好登录问题". Briefly acknowledge the goal.'
+    const session = mock.session(on)
+
+    await $.session.append({
+      message: {
+        type: 'user',
+        role: 'user',
+        isMeta: true,
+        content: [{ type: 'text', text: ack }],
+      },
+      door: 'note',
+      origin: { kind: 'engine' },
+      uuid: 'n1',
     })
 
-    const result = await $.command.run({
-      command: 'goal',
-      args: '修好登录问题',
-    })
-
+    const stored = session.appended().at(-1)
     expect(calls()).toBe(1)
-    expect(reached).toBe('修好登录问题')
-    expect(result.text).toBe('Goal set: 修好登录问题')
-    expect(result.context?.join('\n')).toContain('Fix the login problem')
+    expect(stored?.message.content).toEqual([
+      {
+        type: 'text',
+        text: ack.replace('修好登录问题', 'Fix the login problem'),
+      },
+    ])
   },
 )
 
 test(
-  'goal 查询与清除不带条件，不调用模型',
+  '其他 note 行不翻译也不调用模型',
   { options: { translateInput: true, inputLanguage: 'en' } },
   async ($, on) => {
     const calls = installModel(on, () => 'should not be used')
-    on('command.run', { command: 'goal' }, () => ({ text: '' }))
+    const session = mock.session(on)
 
-    await $.command.run({ command: 'goal', args: '' })
-    await $.command.run({ command: 'goal', args: 'clear' })
-
-    expect(calls()).toBe(0)
-  },
-)
-
-test(
-  'goal 条件已是模型语言时原样通过',
-  { options: { translateInput: true, inputLanguage: 'en' } },
-  async ($, on) => {
-    const calls = installModel(on, () => 'should not be used')
-    on('command.run', { command: 'goal' }, () => ({ text: '' }))
-
-    const result = await $.command.run({
-      command: 'goal',
-      args: 'Fix the login problem',
+    await $.session.append({
+      message: {
+        type: 'user',
+        role: 'user',
+        isMeta: true,
+        content: [{ type: 'text', text: '随便一条说明' }],
+      },
+      door: 'note',
+      origin: { kind: 'engine' },
+      uuid: 'n2',
     })
 
     expect(calls()).toBe(0)
-    expect(result.context ?? []).toEqual([])
+    expect(session.appended().at(-1)?.message.content).toEqual([
+      { type: 'text', text: '随便一条说明' },
+    ])
+  },
+)
+
+test(
+  '条件已是模型语言时原样通过',
+  { options: { translateInput: true, inputLanguage: 'en' } },
+  async ($, on) => {
+    const calls = installModel(on, () => 'should not be used')
+    const ack =
+      'A session-scoped Stop hook is now active with condition: "Fix the login problem". Go.'
+    const session = mock.session(on)
+
+    await $.session.append({
+      message: {
+        type: 'user',
+        role: 'user',
+        isMeta: true,
+        content: [{ type: 'text', text: ack }],
+      },
+      door: 'note',
+      origin: { kind: 'engine' },
+      uuid: 'n3',
+    })
+
+    expect(calls()).toBe(0)
+    expect(session.appended().at(-1)?.message.content).toEqual([
+      { type: 'text', text: ack },
+    ])
   },
 )
 

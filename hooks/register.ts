@@ -25,7 +25,7 @@ import {
   rewriteQuestions,
   translateAnswers,
 } from './questions'
-import { goalConditionContext, isGoalCondition } from './goal'
+import { contentText, goalConditionOf, replaceGoalCondition } from './goal'
 import { containsTable, fitTables } from './tables'
 import {
   cacheKey,
@@ -877,16 +877,22 @@ export const register: Register = (on, options) => {
     }
   }).catch(($, e, next) => next(e))
 
-  // `/goal` 的目标条件是用户原文，会同时进 Stop hook 的提示和目标状态条。
-  // 这里不动参数：屏幕上那行、状态条、会话记录都保持原文，只在输出行之后
-  // 附一条隐藏 context，让模型读得到英文译文。
-  on('command.run', { command: 'goal' }, async ($, e, next) => {
+  // `/goal` 走的是 local-jsx 面板分支，不经过 `command.run`；引擎在设置目标后
+  // 追加一条 `door=note` 的 meta 行把条件念给模型听。那条行只给模型看，屏幕上
+  // 显示的是 `Goal set: …` 输出行和底部状态条，二者都用用户原文，所以在这里
+  // 把行里的条件换成译文即可，输入、会话记录和目标状态都不受影响。
+  on('session.append', { door: 'note' }, async ($, e, next) => {
     try {
       if (!runtime.config.translateInput) return next(e)
-      if (!isGoalCondition(e.args)) return next(e)
+      const content = e.message.content
+      const text = contentText(content)
+      if (text === undefined) return next(e)
+
+      const condition = goalConditionOf(text)
+      if (condition === undefined) return next(e)
       if (
         !shouldTranslate(
-          e.args,
+          condition,
           runtime.config.inputLanguage,
           runtime.config.translationRules,
         )
@@ -894,31 +900,30 @@ export const register: Register = (on, options) => {
         return next(e)
       }
 
-      safeStatus($, '翻译中…')
-      let translation: string | undefined
-      try {
-        const entry = await translate($, {
-          text: e.args,
-          target: runtime.config.inputLanguage,
-          translationRules: runtime.config.translationRules,
-          model: runtime.config.model,
-          kind: 'input',
-        })
-        if (entry.status === 'translated') translation = entry.text
-        else safeLog($, `目标翻译失败：${entry.reason}`)
-      } finally {
-        safeStatus($, undefined)
+      const entry = await translate($, {
+        text: condition,
+        target: runtime.config.inputLanguage,
+        translationRules: runtime.config.translationRules,
+        model: runtime.config.model,
+        kind: 'input',
+      })
+      if (entry.status !== 'translated') {
+        safeLog($, `目标条件翻译失败：${entry.reason}`)
+        return next(e)
       }
 
-      const result = await next(e)
-      if (translation === undefined) return result
-      return {
-        ...result,
-        context: [
-          ...(result.context ?? []),
-          goalConditionContext(translation),
-        ],
-      }
+      const rewritten = replaceGoalCondition(text, entry.text)
+      return next({
+        ...e,
+        message: {
+          ...e.message,
+          content: Array.isArray(content)
+            ? content.map(block =>
+                block.type === 'text' ? { ...block, text: rewritten } : block,
+              )
+            : [{ type: 'text', text: rewritten }],
+        },
+      })
     } catch {
       return next(e)
     }

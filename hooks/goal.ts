@@ -1,30 +1,51 @@
 /**
- * `/goal clear` 这类关闭词由引擎自己处理，不是目标条件，没有可翻的内容。
- * 与引擎里的保留词表保持一致。
+ * `/goal` 设置目标时，引擎追加一条只给模型看的 meta 行：
+ * `A session-scoped Stop hook is now active with condition: "<条件>". …`
+ * 条件是用户原文。这里只换引号里的条件，其余引擎文案原样保留。
  */
-const CLEAR_WORDS: ReadonlySet<string> = new Set([
-  'clear',
-  'stop',
-  'off',
-  'reset',
-  'none',
-  'cancel',
-])
+const CONDITION_PREFIX =
+  'A session-scoped Stop hook is now active with condition: "'
+
+const CONDITION_TAIL = '".'
 
 /**
- * `/goal` 的参数是不是一条需要翻译的目标条件：空参数是查询当前状态，
- * 关闭词是清除目标，这两者都不带条件。
+ * 从这条 meta 行里取出目标条件；不是这条行就返回 undefined。
  */
-export function isGoalCondition(args: string): boolean {
-  const text = args.trim()
-  if (text.length === 0) return false
-  return !CLEAR_WORDS.has(text.toLowerCase())
+export function goalConditionOf(text: string): string | undefined {
+  if (!text.startsWith(CONDITION_PREFIX)) return undefined
+  const end = text.indexOf(CONDITION_TAIL, CONDITION_PREFIX.length)
+  if (end === -1) return undefined
+  const condition = text.slice(CONDITION_PREFIX.length, end)
+  return condition.length > 0 ? condition : undefined
 }
 
 /**
- * 目标条件的译文。作为隐藏 context 附在 `/goal` 输出行之后：模型读到英文，
- * 屏幕上那行、会话记录和目标状态条仍是用户原文。
+ * 一条 row 的正文：单一字符串块，或若干 text block 拼起来。
+ * 这条提示行引擎只放一个 text block；取不到就放弃改写。
  */
-export function goalConditionContext(translation: string): string {
-  return `English translation of the goal condition the person set with /goal:\n${translation}`
+export function contentText(content: unknown): string | undefined {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return undefined
+  const texts = content.map(block =>
+    typeof block === 'object' &&
+    block !== null &&
+    (block as { type?: string }).type === 'text' &&
+    typeof (block as { text?: unknown }).text === 'string'
+      ? ((block as { text: string }).text)
+      : undefined,
+  )
+  if (texts.length === 0 || texts.some(text => text === undefined)) {
+    return undefined
+  }
+  return texts.join('\n')
+}
+
+/**
+ * 把 meta 行里的条件换成译文。行文本可能被拆成多个 text block，逐个处理。
+ */
+export function replaceGoalCondition(text: string, translation: string): string {
+  const condition = goalConditionOf(text)
+  if (condition === undefined) return text
+  const start = CONDITION_PREFIX.length
+  return `${text.slice(0, start)}${translation}${text.slice(start + condition.length)}`
 }
