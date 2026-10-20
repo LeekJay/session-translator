@@ -33,6 +33,11 @@ function localizeBody(body: string): string {
   return body
 }
 
+/** 斜杠命令的输出行会带 `<local-command-stdout>` 包裹，普通提示不会。 */
+export function isCommandStdout(text: string): boolean {
+  return text.startsWith(STDOUT_OPEN) && text.includes(STDOUT_CLOSE)
+}
+
 /**
  * `/goal` 的输出行：`Goal set: …`、`Goal active: …`、`Goal cleared: …`，
  * 以及超长时的长度提示。只换英文前缀，条件是用户自己写的原文。
@@ -44,10 +49,9 @@ export function localizeGoalOutput(
 ): string {
   if (language !== 'zh') return text
 
-  const wrapped =
-    text.startsWith(STDOUT_OPEN) && text.includes(STDOUT_CLOSE)
-      ? text.slice(STDOUT_OPEN.length, text.lastIndexOf(STDOUT_CLOSE))
-      : undefined
+  const wrapped = isCommandStdout(text)
+    ? text.slice(STDOUT_OPEN.length, text.lastIndexOf(STDOUT_CLOSE))
+    : undefined
 
   if (wrapped === undefined) return localizeBody(text)
 

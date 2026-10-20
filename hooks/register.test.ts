@@ -512,6 +512,41 @@ test(
 )
 
 test(
+  '用户自己打的 Goal set 开头的提示不被改写',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    registerRenderBottoms(on)
+    installModel(on, () => 'should not be used')
+
+    const tree = await $.ui.render(
+      userMessageInput('Goal set: 修好登录问题', { kind: 'composer' }),
+    )
+
+    expect(drawnText(tree)).toBe('Goal set: 修好登录问题')
+  },
+)
+
+test(
+  '命令输出行带 stdout 包裹时改前缀',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    registerRenderBottoms(on)
+    installModel(on, () => 'should not be used')
+
+    const tree = await $.ui.render(
+      userMessageInput(
+        '<local-command-stdout>Goal set: 修好登录</local-command-stdout>',
+        { kind: 'composer' },
+      ),
+    )
+
+    expect(drawnText(tree)).toBe(
+      '<local-command-stdout>目标已设置：修好登录</local-command-stdout>',
+    )
+  },
+)
+
+test(
   '其他命令的输出行不改写',
   { options: { translateOutput: true, outputLanguage: 'zh' } },
   async ($, on) => {

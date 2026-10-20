@@ -25,7 +25,7 @@ import {
   rewriteQuestions,
   translateAnswers,
 } from './questions'
-import { localizeGoalOutput } from './goal'
+import { isCommandStdout, localizeGoalOutput } from './goal'
 import { containsTable, fitTables } from './tables'
 import {
   cacheKey,
@@ -896,9 +896,9 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
     try {
-      if (runtime.config.translateOutput) {
+      if (runtime.config.translateOutput && isCommandStdout(e.props.text)) {
         // 斜杠命令的输出行以 `<local-command-stdout>` 包裹出现；普通提示不会
-        // 带这个标记，因此这里不会误伤用户原文。
+        // 带这个标记，因此这里不会把用户自己打的 `Goal set: …` 也改写掉。
         const localized = localizeGoalOutput(
           e.props.text,
           runtime.config.outputLanguage,
