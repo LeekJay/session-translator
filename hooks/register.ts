@@ -25,7 +25,7 @@ import {
   rewriteQuestions,
   translateAnswers,
 } from './questions'
-import { isCommandStdout, localizeGoalOutput } from './goal'
+import { goalConditionContext, isGoalCondition } from './goal'
 import { containsTable, fitTables } from './tables'
 import {
   cacheKey,
@@ -877,18 +877,48 @@ export const register: Register = (on, options) => {
     }
   }).catch(($, e, next) => next(e))
 
-  // /goal 输出行的英文前缀只换给人看的那一份：`ui.render` 改写只作用于绘制，
-  // 会话里存的仍是英文，模型读到的也是英文。
-  on('ui.render', { component: 'CommandOutput' }, ($, e, next) => {
+  // `/goal` 的目标条件是用户原文，会同时进 Stop hook 的提示和目标状态条。
+  // 这里不动参数：屏幕上那行、状态条、会话记录都保持原文，只在输出行之后
+  // 附一条隐藏 context，让模型读得到英文译文。
+  on('command.run', { command: 'goal' }, async ($, e, next) => {
     try {
-      if (!runtime.config.translateOutput) return next(e)
-      if (e.props.command !== 'goal') return next(e)
-      const text = localizeGoalOutput(
-        e.props.text,
-        runtime.config.outputLanguage,
-      )
-      if (text === e.props.text) return next(e)
-      return next({ ...e, props: { ...e.props, text } })
+      if (!runtime.config.translateInput) return next(e)
+      if (!isGoalCondition(e.args)) return next(e)
+      if (
+        !shouldTranslate(
+          e.args,
+          runtime.config.inputLanguage,
+          runtime.config.translationRules,
+        )
+      ) {
+        return next(e)
+      }
+
+      safeStatus($, '翻译中…')
+      let translation: string | undefined
+      try {
+        const entry = await translate($, {
+          text: e.args,
+          target: runtime.config.inputLanguage,
+          translationRules: runtime.config.translationRules,
+          model: runtime.config.model,
+          kind: 'input',
+        })
+        if (entry.status === 'translated') translation = entry.text
+        else safeLog($, `目标翻译失败：${entry.reason}`)
+      } finally {
+        safeStatus($, undefined)
+      }
+
+      const result = await next(e)
+      if (translation === undefined) return result
+      return {
+        ...result,
+        context: [
+          ...(result.context ?? []),
+          goalConditionContext(translation),
+        ],
+      }
     } catch {
       return next(e)
     }
@@ -896,18 +926,6 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
     try {
-      if (runtime.config.translateOutput && isCommandStdout(e.props.text)) {
-        // 斜杠命令的输出行以 `<local-command-stdout>` 包裹出现；普通提示不会
-        // 带这个标记，因此这里不会把用户自己打的 `Goal set: …` 也改写掉。
-        const localized = localizeGoalOutput(
-          e.props.text,
-          runtime.config.outputLanguage,
-        )
-        if (localized !== e.props.text) {
-          return next({ ...e, props: { ...e.props, text: localized } })
-        }
-      }
-
       const kind = e.props.origin.kind
       if (kind !== 'composer' && kind !== 'bridge') return next(e)
       const map = await read($, originals)

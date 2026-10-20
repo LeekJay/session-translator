@@ -1,62 +1,30 @@
-import type { TranslationLanguage } from '../types'
+/**
+ * `/goal clear` 这类关闭词由引擎自己处理，不是目标条件，没有可翻的内容。
+ * 与引擎里的保留词表保持一致。
+ */
+const CLEAR_WORDS: ReadonlySet<string> = new Set([
+  'clear',
+  'stop',
+  'off',
+  'reset',
+  'none',
+  'cancel',
+])
 
 /**
- * `/goal` 的输出行前缀是引擎写死的英文，条件本身是用户原文。
- * 只换前缀，条件和「Last check」等其余内容原样保留。
+ * `/goal` 的参数是不是一条需要翻译的目标条件：空参数是查询当前状态，
+ * 关闭词是清除目标，这两者都不带条件。
  */
-const ZH_PREFIXES: ReadonlyArray<readonly [string, string]> = [
-  ['Goal set: ', '目标已设置：'],
-  ['Goal cleared: ', '目标已清除：'],
-  ['Goal active: ', '目标进行中：'],
-]
-
-const LIMIT_PREFIX = 'Goal condition is limited to '
-const LIMIT_TAIL = /^(\d+) characters \(got (\d+)\)$/
-
-const STDOUT_OPEN = '<local-command-stdout>'
-const STDOUT_CLOSE = '</local-command-stdout>'
-
-function localizeBody(body: string): string {
-  for (const [prefix, replacement] of ZH_PREFIXES) {
-    if (body.startsWith(prefix)) {
-      return `${replacement}${body.slice(prefix.length)}`
-    }
-  }
-
-  if (body.startsWith(LIMIT_PREFIX)) {
-    const limit = LIMIT_TAIL.exec(body.slice(LIMIT_PREFIX.length))
-    if (limit !== null) {
-      return `目标条件最多 ${limit[1]} 个字符（当前 ${limit[2]} 个）`
-    }
-  }
-
-  return body
-}
-
-/** 斜杠命令的输出行会带 `<local-command-stdout>` 包裹，普通提示不会。 */
-export function isCommandStdout(text: string): boolean {
-  return text.startsWith(STDOUT_OPEN) && text.includes(STDOUT_CLOSE)
+export function isGoalCondition(args: string): boolean {
+  const text = args.trim()
+  if (text.length === 0) return false
+  return !CLEAR_WORDS.has(text.toLowerCase())
 }
 
 /**
- * `/goal` 的输出行：`Goal set: …`、`Goal active: …`、`Goal cleared: …`，
- * 以及超长时的长度提示。只换英文前缀，条件是用户自己写的原文。
- * 行文本可能带 `<local-command-stdout>` 包裹，原样保留。
+ * 目标条件的译文。作为隐藏 context 附在 `/goal` 输出行之后：模型读到英文，
+ * 屏幕上那行、会话记录和目标状态条仍是用户原文。
  */
-export function localizeGoalOutput(
-  text: string,
-  language: TranslationLanguage,
-): string {
-  if (language !== 'zh') return text
-
-  const wrapped = isCommandStdout(text)
-    ? text.slice(STDOUT_OPEN.length, text.lastIndexOf(STDOUT_CLOSE))
-    : undefined
-
-  if (wrapped === undefined) return localizeBody(text)
-
-  const body = localizeBody(wrapped)
-  return body === wrapped
-    ? text
-    : `${STDOUT_OPEN}${body}${text.slice(text.lastIndexOf(STDOUT_CLOSE))}`
+export function goalConditionContext(translation: string): string {
+  return `English translation of the goal condition the person set with /goal:\n${translation}`
 }

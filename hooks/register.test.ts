@@ -487,62 +487,56 @@ test(
 )
 
 test(
-  'goal 命令输出行只把英文前缀换成中文，条件保持原文',
-  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  'goal 的目标条件翻成英文挂在输出行之后，参数本身不改',
+  { options: { translateInput: true, inputLanguage: 'en' } },
   async ($, on) => {
-    on('ui.render', { component: 'CommandOutput' }, ($, e) => {
-      const { Text } = $.ui.resolve(e)
-      return h(Text, null, e.props.text) as RenderElement
+    let reached = ''
+    const calls = installModel(on, () => translated('Fix the login problem'))
+    on('command.run', { command: 'goal' }, ($, e) => {
+      reached = e.args
+      return { text: 'Goal set: 修好登录问题' }
     })
 
-    const tree = await $.ui.render({
-      surface: 'terminal',
-      component: 'CommandOutput',
-      requestId: 'c1',
-      props: {
-        command: 'goal',
-        args: '修好登录问题',
-        text: 'Goal set: 修好登录问题',
-        isErrored: false,
-      },
+    const result = await $.command.run({
+      command: 'goal',
+      args: '修好登录问题',
     })
 
-    expect(drawnText(tree)).toBe('目标已设置：修好登录问题')
+    expect(calls()).toBe(1)
+    expect(reached).toBe('修好登录问题')
+    expect(result.text).toBe('Goal set: 修好登录问题')
+    expect(result.context?.join('\n')).toContain('Fix the login problem')
   },
 )
 
 test(
-  '用户自己打的 Goal set 开头的提示不被改写',
-  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  'goal 查询与清除不带条件，不调用模型',
+  { options: { translateInput: true, inputLanguage: 'en' } },
   async ($, on) => {
-    registerRenderBottoms(on)
-    installModel(on, () => 'should not be used')
+    const calls = installModel(on, () => 'should not be used')
+    on('command.run', { command: 'goal' }, () => ({ text: '' }))
 
-    const tree = await $.ui.render(
-      userMessageInput('Goal set: 修好登录问题', { kind: 'composer' }),
-    )
+    await $.command.run({ command: 'goal', args: '' })
+    await $.command.run({ command: 'goal', args: 'clear' })
 
-    expect(drawnText(tree)).toBe('Goal set: 修好登录问题')
+    expect(calls()).toBe(0)
   },
 )
 
 test(
-  '命令输出行带 stdout 包裹时改前缀',
-  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  'goal 条件已是模型语言时原样通过',
+  { options: { translateInput: true, inputLanguage: 'en' } },
   async ($, on) => {
-    registerRenderBottoms(on)
-    installModel(on, () => 'should not be used')
+    const calls = installModel(on, () => 'should not be used')
+    on('command.run', { command: 'goal' }, () => ({ text: '' }))
 
-    const tree = await $.ui.render(
-      userMessageInput(
-        '<local-command-stdout>Goal set: 修好登录</local-command-stdout>',
-        { kind: 'composer' },
-      ),
-    )
+    const result = await $.command.run({
+      command: 'goal',
+      args: 'Fix the login problem',
+    })
 
-    expect(drawnText(tree)).toBe(
-      '<local-command-stdout>目标已设置：修好登录</local-command-stdout>',
-    )
+    expect(calls()).toBe(0)
+    expect(result.context ?? []).toEqual([])
   },
 )
 
