@@ -25,6 +25,7 @@ import {
   rewriteQuestions,
   translateAnswers,
 } from './questions'
+import { localizeGoalOutput } from './goal'
 import { containsTable, fitTables } from './tables'
 import {
   cacheKey,
@@ -876,8 +877,37 @@ export const register: Register = (on, options) => {
     }
   }).catch(($, e, next) => next(e))
 
+  // /goal 输出行的英文前缀只换给人看的那一份：`ui.render` 改写只作用于绘制，
+  // 会话里存的仍是英文，模型读到的也是英文。
+  on('ui.render', { component: 'CommandOutput' }, ($, e, next) => {
+    try {
+      if (!runtime.config.translateOutput) return next(e)
+      if (e.props.command !== 'goal') return next(e)
+      const text = localizeGoalOutput(
+        e.props.text,
+        runtime.config.outputLanguage,
+      )
+      if (text === e.props.text) return next(e)
+      return next({ ...e, props: { ...e.props, text } })
+    } catch {
+      return next(e)
+    }
+  }).catch(($, e, next) => next(e))
+
   on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
     try {
+      if (runtime.config.translateOutput) {
+        // 斜杠命令的输出行以 `<local-command-stdout>` 包裹出现；普通提示不会
+        // 带这个标记，因此这里不会误伤用户原文。
+        const localized = localizeGoalOutput(
+          e.props.text,
+          runtime.config.outputLanguage,
+        )
+        if (localized !== e.props.text) {
+          return next({ ...e, props: { ...e.props, text: localized } })
+        }
+      }
+
       const kind = e.props.origin.kind
       if (kind !== 'composer' && kind !== 'bridge') return next(e)
       const map = await read($, originals)

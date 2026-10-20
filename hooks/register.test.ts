@@ -487,6 +487,56 @@ test(
 )
 
 test(
+  'goal 命令输出行只把英文前缀换成中文，条件保持原文',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    on('ui.render', { component: 'CommandOutput' }, ($, e) => {
+      const { Text } = $.ui.resolve(e)
+      return h(Text, null, e.props.text) as RenderElement
+    })
+
+    const tree = await $.ui.render({
+      surface: 'terminal',
+      component: 'CommandOutput',
+      requestId: 'c1',
+      props: {
+        command: 'goal',
+        args: '修好登录问题',
+        text: 'Goal set: 修好登录问题',
+        isErrored: false,
+      },
+    })
+
+    expect(drawnText(tree)).toBe('目标已设置：修好登录问题')
+  },
+)
+
+test(
+  '其他命令的输出行不改写',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    on('ui.render', { component: 'CommandOutput' }, ($, e) => {
+      const { Text } = $.ui.resolve(e)
+      return h(Text, null, e.props.text) as RenderElement
+    })
+
+    const tree = await $.ui.render({
+      surface: 'terminal',
+      component: 'CommandOutput',
+      requestId: 'c2',
+      props: {
+        command: 'translator',
+        args: 'status',
+        text: 'Goal set: 修好登录问题',
+        isErrored: false,
+      },
+    })
+
+    expect(drawnText(tree)).toBe('Goal set: 修好登录问题')
+  },
+)
+
+test(
   '翻译写入缓存后重绘显示译文且不改会话记录',
   { options: { translateOutput: true, outputLanguage: 'zh' } },
   async ($, on) => {
