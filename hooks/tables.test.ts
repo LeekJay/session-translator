@@ -58,3 +58,9 @@ test('只转换超过视口的那张表', {}, async () => {
   expect(output).toContain('| 甲 | 乙 |')
   expect(output).toContain('- **区域**: 客户端')
 })
+
+test('含长链接的窄中文表格保持表格', {}, async () => {
+  const text =
+    '| 名称 | 文档 |\n|---|---|\n| 指南 | [查看](https://example.com/very/long/url/path/that/exceeds/viewport/width) |'
+  expect(fitTables(text, 40)).toBe(text)
+})

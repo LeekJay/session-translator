@@ -43,7 +43,12 @@ function displayWidth(text: string): number {
 }
 
 function visibleWidth(cell: string): number {
-  return displayWidth(cell.replace(/`/g, '').replace(/\*\*/g, ''))
+  return displayWidth(
+    cell
+      .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+      .replace(/`/g, '')
+      .replace(/\*\*/g, ''),
+  )
 }
 
 function hasWideText(cells: readonly string[]): boolean {
