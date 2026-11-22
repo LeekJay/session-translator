@@ -280,6 +280,43 @@ test(
 )
 
 test(
+  '启动时不批量读取逐条原文，渲染时按需读取一次并缓存',
+  { options: { translateInput: true, inputLanguage: 'en' } },
+  async ($, on) => {
+    registerRenderBottoms(on)
+    const store: Record<string, unknown> = {
+      'originals:m-lazy-1': '第一条原文',
+      'originals:m-lazy-2': '第二条原文',
+    }
+
+    let perKeyReads = 0
+    on('store.keys', () => ({ value: Object.keys(store) }))
+    on('store.get', (_$inner, e) => {
+      if (e.key.startsWith('originals:')) {
+        perKeyReads += 1
+      }
+      return { value: store[e.key] }
+    })
+
+    on('session.start', ($inner, e) => e)
+    await $.session.start({ cwd: '.' })
+    expect(perKeyReads).toBe(0)
+
+    const first = await $.ui.render(
+      userMessageInput('OK', { kind: 'composer' }, 'm-lazy-1'),
+    )
+    expect(drawnText(first)).toBe('第一条原文')
+    expect(perKeyReads).toBe(1)
+
+    const second = await $.ui.render(
+      userMessageInput('OK', { kind: 'composer' }, 'm-lazy-1'),
+    )
+    expect(drawnText(second)).toBe('第一条原文')
+    expect(perKeyReads).toBe(1)
+  },
+)
+
+test(
   '各自独立写原文，新会话重载后三条都还在',
   {
     options: { translateInput: true, inputLanguage: 'en' },

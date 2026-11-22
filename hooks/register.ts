@@ -79,6 +79,8 @@ type PendingInput = {
 // 排队提交时可能有多条同时等待落库，按先后顺序匹配；上限防止异常情况无限增长。
 const pendingInputs: PendingInput[] = []
 const MAX_PENDING_INPUTS = 16
+let legacyOriginals: OriginalPrompts = {}
+const loadedOriginals = new Map<string, string>()
 
 export type ScheduleResult = 'scheduled' | 'busy' | 'failed'
 
@@ -188,8 +190,8 @@ async function persistOriginal(
   }
 }
 
-// 会话开始时按前缀逐条取回；keys() 按插入顺序返回，最旧的排在前面，
-// 超出上限时从最旧的开始删。忽略旧版本的整表 'originals' 键。
+// 会话开始时只读取旧版整表 'originals' 键并修剪超出上限的逐条键；
+// 逐条键改为在 UserMessage 渲染时按需懒加载，避免启动时批量读取阻塞。
 // 旧版本把原文存成一个整表 'originals' 键；升级后仍读它，否则旧会话
 // --resume 后原文全部丢失。新格式的逐条键优先级更高。
 const LEGACY_ORIGINALS_KEY = 'originals'
@@ -213,29 +215,11 @@ async function readLegacyOriginals(
   }
 }
 
-async function loadStoredOriginals($: EngineInterface): Promise<void> {
+async function pruneStoredOriginals($: EngineInterface): Promise<void> {
   try {
-    const legacy = await readLegacyOriginals($)
     const keys = (await $.store.keys()).filter(key =>
       key.startsWith(ORIGINALS_KEY_PREFIX),
     )
-    const values = await Promise.all(keys.map(key => $.store.get(key)))
-
-    // 先铺旧格式，再用逐条键覆盖：同一消息 ID 以新格式为准。
-    const saved: OriginalPrompts = { ...legacy }
-    for (let index = 0; index < keys.length; index += 1) {
-      const value = values[index]
-      if (typeof value !== 'string') continue
-      const messageId = keys[index]!.slice(ORIGINALS_KEY_PREFIX.length)
-      saved[messageId] = value
-    }
-
-    if (Object.keys(saved).length > 0) {
-      await update($, originals, current =>
-        pruneOriginals({ ...saved, ...current }),
-      )
-    }
-
     // keys() 按插入顺序返回，超出的部分是最旧的，从前面开始删。
     const excess = keys.length - MAX_ORIGINAL_PROMPTS
     for (const key of keys.slice(0, Math.max(0, excess))) {
@@ -244,6 +228,37 @@ async function loadStoredOriginals($: EngineInterface): Promise<void> {
   } catch {
     // store 不可用时只影响 --resume 后的原文显示。
   }
+}
+
+async function loadOriginalForMessage(
+  $: EngineInterface,
+  messageId: string,
+  legacy: OriginalPrompts,
+): Promise<string | undefined> {
+  const cached = loadedOriginals.get(messageId)
+  if (cached !== undefined) return cached
+
+  let original: string | undefined
+  try {
+    const value = await $.store.get(storedOriginalKey(messageId))
+    if (typeof value === 'string') {
+      original = value
+    }
+  } catch {
+    // store 读失败时尝试回退到旧版整表。
+  }
+
+  if (original === undefined) {
+    original = legacy[messageId]
+  }
+  if (original === undefined) return undefined
+
+  if (loadedOriginals.size >= MAX_ORIGINAL_PROMPTS) {
+    const oldest = loadedOriginals.keys().next().value
+    if (oldest !== undefined) loadedOriginals.delete(oldest)
+  }
+  loadedOriginals.set(messageId, original)
+  return original
 }
 
 export type Options = {
@@ -671,7 +686,9 @@ export const register: Register = (on, options) => {
       // 读取失败时从空缓存开始，回复照常翻译。
     }
 
-    await loadStoredOriginals($)
+    loadedOriginals.clear()
+    legacyOriginals = await readLegacyOriginals($)
+    await pruneStoredOriginals($)
 
     try {
       await $.command.register({
@@ -941,7 +958,10 @@ export const register: Register = (on, options) => {
       if (typeof messageId !== 'string') return next(e)
 
       const map = await read($, originals)
-      const original = map[messageId]
+      let original = map[messageId]
+      if (original === undefined) {
+        original = await loadOriginalForMessage($, messageId, legacyOriginals)
+      }
       if (original === undefined) return next(e)
 
       return next({ ...e, props: { ...e.props, text: original } })
