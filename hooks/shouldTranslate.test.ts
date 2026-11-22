@@ -1,4 +1,5 @@
 import { expect, test } from 'claude-code/testing'
+import { detectSourceLanguage } from './languages'
 import { shouldTranslate } from './translate'
 
 test('英语正文不额外翻译', {}, async () => {
@@ -34,6 +35,21 @@ test('没有英语功能词的长句按未知语言处理', {}, async () => {
   ).toBe(true)
 })
 
+test('无重音且无标记词的法语短句按未知语言翻译', {}, async () => {
+  expect(detectSourceLanguage('Bonjour tout simplement')).toBeUndefined()
+  expect(shouldTranslate('Bonjour tout simplement', 'en', '')).toBe(true)
+})
+
+test('无重音且无标记词的意大利语和西班牙语短句照常翻译', {}, async () => {
+  expect(shouldTranslate('Ciao come stai', 'en', '')).toBe(true)
+  expect(shouldTranslate('Hola amigo', 'en', '')).toBe(true)
+})
+
+test('命中常见英语词时仍判为英语', {}, async () => {
+  expect(detectSourceLanguage('Please refactor the payment module.')).toBe('en')
+  expect(detectSourceLanguage('fix this')).toBe('en')
+})
+
 test('中文提示在目标语言为英语时照常翻译', {}, async () => {
   expect(shouldTranslate('请修好登录问题。', 'en', '')).toBe(true)
 })
@@ -44,10 +60,13 @@ test('目标语言不是英语时英语提示照常翻译', {}, async () => {
   )
 })
 
-test('自定义规则强制翻译', {}, async () => {
-  expect(shouldTranslate('Please refactor the payment module.', 'en', '- 保留术语')).toBe(
-    true,
-  )
+test('自定义规则不改变同语言跳过', {}, async () => {
+  expect(
+    shouldTranslate('Please refactor the payment module.', 'en', '- 保留术语'),
+  ).toBe(false)
+  expect(shouldTranslate('请修好登录问题。', 'zh', '- 保留术语')).toBe(false)
+  // 规则不阻止确实需要的翻译。
+  expect(shouldTranslate('请修好登录问题。', 'en', '- 保留术语')).toBe(true)
 })
 
 test('斜杠命令不翻译', {}, async () => {

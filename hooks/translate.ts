@@ -14,12 +14,19 @@ import {
 import type { TranslationKind } from './prompt'
 import { buildTranslationRequest, parseTranslationResponse } from './prompt'
 
-const MAX_CACHE_ENTRIES = 300
+export const MAX_CACHE_ENTRIES = 300
 
+// 条目数之外再加总字符上限：一条助手回复可能上万字符，300 条长回复会让
+// 插件内存和 store 达到数 MB。约 100 万字符（UTF-16 下约 2 MB）足够复用，
+// 又不会无限增长。
+export const MAX_CACHE_CHARS = 1_000_000
+
+// 瞬时失败和可重试的解析失败都不写缓存：下一次遇到同样的文本会重新请求模型。
 const TRANSIENT_FAILURES: readonly string[] = [
   'api-error',
   'empty-reply',
   'aborted',
+  'unusable-questions',
 ]
 
 export function isTransientFailure(reason: string): boolean {
@@ -83,7 +90,23 @@ export function cacheKey(
   return `${signature}:${target}:${kind}:${fnv1a(text)}`
 }
 
-function isCacheEntry(value: unknown): value is TranslationCacheEntry {
+// 选择对话框的缓存键在共享签名（输入/输出语言、模型、规则、回复提示词版本）
+// 之外再带上问题提示词版本：问题提示词单独演进，不能靠回复提示词版本兜底。
+export function questionsCacheKey(
+  signature: string,
+  target: TranslationLanguage,
+  promptVersion: string,
+  texts: readonly string[],
+): string {
+  return cacheKey(
+    signature,
+    target,
+    'questions',
+    `${promptVersion}\u0000tool-questions\u0000${JSON.stringify(texts)}`,
+  )
+}
+
+export function isCacheEntry(value: unknown): value is TranslationCacheEntry {
   if (value === null || typeof value !== 'object') return false
   const entry = value as {
     readonly status?: unknown
@@ -95,43 +118,38 @@ function isCacheEntry(value: unknown): value is TranslationCacheEntry {
   return false
 }
 
-export function isTranslationCache(value: unknown): value is TranslationCache {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    return false
-  }
-  return Object.values(value as Record<string, unknown>).every(isCacheEntry)
-}
+// 内存缓存和 store 修剪共用同一套淘汰边界。textLengths 按最旧到最新排列，
+// 返回需要从头部淘汰的条数：失败条目传 0（不占字符预算，但仍占条目名额）。
+export function excessCacheEntryCount(textLengths: readonly number[]): number {
+  let totalChars = 0
+  for (const length of textLengths) totalChars += length
 
-/**
- * 跨会话恢复：持久化的条目排在前面，本次会话已有的条目覆盖它们，
- * 这样 pruneCache 淘汰最久的一条时淘汰的是更早会话留下的。
- */
-export function mergeCaches(
-  saved: unknown,
-  current: TranslationCache,
-): TranslationCache {
-  if (!isTranslationCache(saved)) return current
-  return { ...saved, ...current }
+  let dropCount = 0
+  while (dropCount < textLengths.length) {
+    const overEntries = textLengths.length - dropCount > MAX_CACHE_ENTRIES
+    if (!overEntries && totalChars <= MAX_CACHE_CHARS) break
+    totalChars -= textLengths[dropCount] ?? 0
+    dropCount += 1
+  }
+  return dropCount
 }
 
 export function pruneCache(cache: TranslationCache): TranslationCache {
   const keys = Object.keys(cache)
-  if (keys.length <= MAX_CACHE_ENTRIES) return cache
+  if (keys.length === 0) return cache
+
+  const textLengths = keys.map(key => {
+    const entry = cache[key]
+    if (entry === undefined || entry.status !== 'translated') return 0
+    return entry.text.length
+  })
+  const dropCount = excessCacheEntryCount(textLengths)
+  if (dropCount === 0) return cache
 
   const kept: TranslationCache = {}
-  for (const key of keys.slice(keys.length - MAX_CACHE_ENTRIES)) {
+  for (const key of keys.slice(dropCount)) {
     const entry = cache[key]
     if (entry !== undefined) kept[key] = entry
-  }
-  return kept
-}
-
-// 只把成功译文写进持久化缓存。失败条目留在内存里，下次会话会重试；
-// 否则一次格式错误的回复会让这条原文永久停在原文。
-export function persistableCache(cache: TranslationCache): TranslationCache {
-  const kept: TranslationCache = {}
-  for (const [key, entry] of Object.entries(cache)) {
-    if (entry.status === 'translated') kept[key] = entry
   }
   return kept
 }
@@ -177,7 +195,8 @@ function looksLikeCodeDocument(text: string): boolean {
 export function shouldTranslate(
   text: string,
   target: TranslationLanguage,
-  translationRules: string,
+  // 保留该参数以兼容调用方：规则只在真正翻译时生效，不参与是否翻译的判断。
+  _translationRules: string,
 ): boolean {
   const trimmed = text.trim()
   if (trimmed.length === 0) return false
@@ -188,9 +207,10 @@ export function shouldTranslate(
   if (!hasTranslatableProse(protectedText.text)) return false
   if (looksLikeCodeDocument(protectedText.text)) return false
 
-  const hasRules = translationRules.trim().length > 0
+  // 同语言跳过与自定义规则无关：规则约束的是译文措辞（术语、风格），
+  // 不能把已经符合目标语言的文本再送去翻译一遍。
   const prose = protectedText.text.replace(PLACEHOLDER_PATTERN, ' ')
-  if (!hasRules && detectSourceLanguage(prose) === target) return false
+  if (detectSourceLanguage(prose) === target) return false
 
   return true
 }

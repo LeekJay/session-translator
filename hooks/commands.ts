@@ -91,7 +91,30 @@ export const SKIP_COMMAND_ARGS_TRANSLATION: ReadonlySet<string> = new Set([
   'mobile',
   'chrome',
   'goal',
+  'loop',
+  'run',
+  'code-review',
+  'security-review',
+  'statusline',
 ])
+
+// 机器参数：旗标、数字/时长、路径、key=value。这类 token 翻译任何一个都可能
+// 改坏命令语义。只有全部 token 都是机器语法时才判为机器参数；npm、test 这类
+// 普通小写单词不算机器 token，交给上面的跳过名单处理。
+const MACHINE_ARG_PATTERNS: readonly RegExp[] = [
+  /^--?[A-Za-z][\w-]*(?:=\S*)?$/, // -x、--fix、--fix=true
+  /^\d+(?:\.\d+)?(?:ms|[smhdw])?$/, // 5、5m、2.5h；3rd 这类序号不算时长
+  /^(?:[A-Za-z]:[\\/]|\.{0,2}\/|~[\\/])\S*$/, // /review、./x、../x、C:\x、~/x
+  /^[A-Za-z_][\w.-]*=\S*$/, // key=value
+]
+
+export function looksLikeMachineArgs(args: string): boolean {
+  const tokens = args.match(/\S+/g) ?? []
+  if (tokens.length === 0) return false
+  return tokens.every(token =>
+    MACHINE_ARG_PATTERNS.some(pattern => pattern.test(token)),
+  )
+}
 
 function booleanOption(
   options: PluginOptions,

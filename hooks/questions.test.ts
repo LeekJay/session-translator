@@ -54,10 +54,10 @@ test('改写替换文本字段并保留结构和预览', {}, async () => {
   expect(question.multiSelect).toBe(false)
 
   const options = question.options as Array<Record<string, unknown>>
-  expect(options[0].label).toBe('维特')
-  expect(options[0].description).toBe('快且原生支持 Vite。')
-  expect(options[0].preview).toBe('vitest run')
-  expect(options[1].label).toBe('杰斯特')
+  expect(options[0]?.label).toBe('维特')
+  expect(options[0]?.description).toBe('快且原生支持 Vite。')
+  expect(options[0]?.preview).toBe('vitest run')
+  expect(options[1]?.label).toBe('杰斯特')
 })
 
 test('答案映射回原问题文本与英文标签', {}, async () => {

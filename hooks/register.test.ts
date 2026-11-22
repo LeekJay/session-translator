@@ -1,9 +1,11 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type {
+  CommandRunInput,
   On,
   PromptOrigin,
   RenderElement,
   RenderInput,
+  SessionStartInput,
 } from 'claude-code'
 import { PROMPT_TAG } from './prompt'
 import {
@@ -14,6 +16,13 @@ import {
   settingsPayload,
 } from './register'
 import type { Options } from './register'
+import {
+  createStorageState,
+  excessCacheKeys,
+  rememberPersistedEntry,
+  retainPersistedKeys,
+  storedCacheEntrySizeKey,
+} from './storage'
 import { cacheKey, translationSignature } from './translate'
 
 const USAGE = {
@@ -34,6 +43,21 @@ function answered(text: string) {
   return { isAnswered: true as const, text, usage: USAGE }
 }
 
+// 测试里的 `$` 是引擎调用侧，收完整入参；插件侧的同名 API 才允许省略
+// 引擎自己填的 origin / presentation / surface / isInteractive。
+function commandRunInput(command: string, args: string): CommandRunInput {
+  return {
+    command,
+    args,
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: false, columns: 80 },
+  }
+}
+
+function sessionStartInput(cwd: string): SessionStartInput {
+  return { cwd, surface: 'terminal', isInteractive: true }
+}
+
 function installModel(
   on: On,
   respond: (source: string, system: string) => string,
@@ -48,6 +72,30 @@ function installModel(
 
 function translated(source: string): string {
   return JSON.stringify({ translation: source })
+}
+
+// 缓存测试统一用这份签名，store key 只随原文变化。
+function outputCacheKey(source: string): string {
+  return cacheKey(
+    translationSignature({
+      inputLanguage: 'en',
+      outputLanguage: 'zh',
+      model: 'haiku',
+      translationRules: '',
+      promptVersion: PROMPT_TAG,
+    }),
+    'zh',
+    'output',
+    source,
+  )
+}
+
+function cacheEntryStoreKey(source: string): string {
+  return `cache-entry:${outputCacheKey(source)}`
+}
+
+function cacheSizeStoreKey(source: string, textLength: number): string {
+  return storedCacheEntrySizeKey(outputCacheKey(source), textLength)
 }
 
 const CHINESE_UNIT = '请帮我看看这个文件'
@@ -309,7 +357,7 @@ test(
     registerRenderBottoms(on)
     mock.store(on, { 'originals:m-old': '旧的原文' })
     on('session.start', ($inner, e) => e)
-    await $.session.start({ cwd: '.' })
+    await $.session.start(sessionStartInput('.'))
 
     const drawn = await $.ui.render(
       userMessageInput('OK', { kind: 'composer' }, 'm-old'),
@@ -338,7 +386,7 @@ test(
     })
 
     on('session.start', ($inner, e) => e)
-    await $.session.start({ cwd: '.' })
+    await $.session.start(sessionStartInput('.'))
     expect(perKeyReads).toBe(0)
 
     const first = await $.ui.render(
@@ -406,7 +454,7 @@ test(
     await $.session.append(appendedUserMessage('OK', 'm-new-2') as never)
 
     // 新会话从 store 逐条装回。
-    await $.session.start({ cwd: '.' })
+    await $.session.start(sessionStartInput('.'))
 
     const seeded = await $.ui.render(
       userMessageInput('OK', { kind: 'composer' }, 'm-old'),
@@ -457,7 +505,7 @@ test(
     }
     mock.store(on, entries)
 
-    await $.session.start({ cwd: '.' })
+    await $.session.start(sessionStartInput('.'))
 
     const pruned = await $.ui.render(
       userMessageInput('OK', { kind: 'composer' }, 'm-0'),
@@ -484,7 +532,7 @@ test(
     // 旧版本把原文存成一个整表键；升级后必须仍能读出，否则旧会话 --resume 丢原文。
     mock.store(on, { originals: { 'm-legacy': '旧格式原文' } })
     on('session.start', ($inner, e) => e)
-    await $.session.start({ cwd: '.' })
+    await $.session.start(sessionStartInput('.'))
 
     const drawn = await $.ui.render(
       userMessageInput('OK', { kind: 'composer' }, 'm-legacy'),
@@ -503,7 +551,7 @@ test(
       'originals:m-both': '新格式原文',
     })
     on('session.start', ($inner, e) => e)
-    await $.session.start({ cwd: '.' })
+    await $.session.start(sessionStartInput('.'))
 
     const drawn = await $.ui.render(
       userMessageInput('OK', { kind: 'composer' }, 'm-both'),
@@ -976,6 +1024,194 @@ test(
     await $.tool.call({ tool: 'AskUserQuestion', questions })
     expect(calls()).toBe(1)
     expect(asked).toEqual(questions)
+  },
+)
+
+test(
+  '选择对话框首次回复 JSON 损坏时纠正重试并显示译文',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    const clock = mock.clock(on)
+    let asked: Array<Record<string, unknown>> = []
+
+    on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
+      asked = e.questions as Array<Record<string, unknown>>
+      const first = asked[0]!
+      const key = String(first.question)
+      const options = first.options as Array<Record<string, unknown>>
+      return {
+        result: { questions: e.questions, answers: { [key]: options[0]!.label } },
+      }
+    })
+
+    // 第一次回复是截断的 JSON，纠正重试才拿到完整译文。
+    const prompts: string[] = []
+    on('model.complete', ($, e) => {
+      prompts.push(e.prompt)
+      return {
+        value: answered(
+          prompts.length === 1
+            ? '{"translations":["用哪个库？",'
+            : '{"translations":["用哪个库？","库","甲","第一个选项。","乙","第二个选项。"]}',
+        ),
+      }
+    })
+
+    const questions = [
+      {
+        question: 'Which library?',
+        header: 'Library',
+        multiSelect: false,
+        options: [
+          { label: 'Alpha', description: 'First option.' },
+          { label: 'Beta', description: 'Second option.' },
+        ],
+      },
+    ]
+
+    await $.tool.call({ tool: 'AskUserQuestion', questions })
+
+    expect(prompts.length).toBe(2)
+    expect(prompts[1]).toContain('{"translations":[...]}')
+    expect(asked[0]?.question).toBe('用哪个库？')
+    const options = asked[0]?.options as Array<Record<string, unknown>>
+    expect(options[0]?.label).toBe('甲')
+    expect(options[1]?.label).toBe('乙')
+
+    await clock.advance(1)
+    await clock.settle()
+  },
+)
+
+test(
+  '选择对话框两次回复都损坏时不缓存失败，下次仍重试',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    const clock = mock.clock(on)
+    let asked: Array<Record<string, unknown>> = []
+
+    on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
+      asked = e.questions as Array<Record<string, unknown>>
+      const first = asked[0]!
+      const key = String(first.question)
+      const options = first.options as Array<Record<string, unknown>>
+      return {
+        result: { questions: e.questions, answers: { [key]: options[0]!.label } },
+      }
+    })
+
+    // 首发和重试都损坏：对话框画原文，但失败不写入缓存。
+    const calls = installModel(on, () => 'not json')
+
+    const questions = [
+      {
+        question: 'Which library?',
+        header: 'Library',
+        multiSelect: false,
+        options: [
+          { label: 'Alpha', description: 'First option.' },
+          { label: 'Beta', description: 'Second option.' },
+        ],
+      },
+    ]
+
+    await $.tool.call({ tool: 'AskUserQuestion', questions })
+    expect(calls()).toBe(2)
+    expect(asked).toEqual(questions)
+
+    await clock.advance(1)
+    await clock.settle()
+
+    // 缓存里没有这条失败：同一对话框重开时重新请求（首发 + 重试）。
+    await $.tool.call({ tool: 'AskUserQuestion', questions })
+    expect(calls()).toBe(4)
+    expect(asked).toEqual(questions)
+
+    await clock.advance(1)
+    await clock.settle()
+  },
+)
+
+test(
+  '选择对话框的内存失败条目会重查 store，其他会话成功后显示译文',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    // A 会话把长问题译成英文，得到非瞬时的 wrong-language 失败并写进内存；
+    // B 会话随后用同一个 key 成功持久化，A 重开对话框应显示译文且不再请求模型。
+    const clock = mock.clock(on)
+    let asked: Array<Record<string, unknown>> = []
+
+    on('tool.call', { tool: 'AskUserQuestion' }, ($inner, e) => {
+      asked = e.questions as Array<Record<string, unknown>>
+      const first = asked[0]!
+      const key = String(first.question)
+      const options = first.options as Array<Record<string, unknown>>
+      return {
+        result: { questions: e.questions, answers: { [key]: options[0]!.label } },
+      }
+    })
+
+    const stored = new Map<string, unknown>()
+    let storeKey: string | undefined
+    let entryReads = 0
+    on('store.get', ($inner, e) => {
+      if (!e.key.startsWith('cache-entry:')) return { value: undefined }
+      storeKey = e.key
+      entryReads += 1
+      return { value: stored.get(e.key) }
+    })
+
+    const calls = installModel(
+      on,
+      () =>
+        '{"translations":["Which library should the client use for this integration?","Library","Alpha","First option.","Beta","Second option."]}',
+    )
+
+    const questions = [
+      {
+        question: 'Which library should the client use for this integration?',
+        header: 'Library',
+        multiSelect: false,
+        options: [
+          { label: 'Alpha', description: 'First option.' },
+          { label: 'Beta', description: 'Second option.' },
+        ],
+      },
+    ]
+
+    await $.tool.call({ tool: 'AskUserQuestion', questions })
+    expect(calls()).toBe(1)
+    expect(asked).toEqual(questions)
+    await clock.advance(1)
+    await clock.settle()
+    expect(storeKey).toBeDefined()
+    expect(entryReads).toBe(1)
+
+    // B 写入之前重开：store 仍为空，重查后保留失败，不重新请求模型。
+    await $.tool.call({ tool: 'AskUserQuestion', questions })
+    expect(entryReads).toBe(2)
+    expect(calls()).toBe(1)
+    expect(asked).toEqual(questions)
+    await clock.advance(1)
+    await clock.settle()
+
+    // B 用 A 首次读取的同一个 key 成功翻译并持久化。
+    stored.set(storeKey!, {
+      status: 'translated',
+      text: '{"translations":["用哪个库？","库","甲","第一个选项。","乙","第二个选项。"]}',
+    })
+
+    // A 重开：选项显示译文，模型调用次数不变。
+    await $.tool.call({ tool: 'AskUserQuestion', questions })
+    expect(calls()).toBe(1)
+    const shown = asked[0]!
+    expect(shown.question).toBe('用哪个库？')
+    const options = shown.options as Array<Record<string, unknown>>
+    expect(options[0]?.label).toBe('甲')
+    expect(options[1]?.label).toBe('乙')
+    await clock.advance(1)
+    await clock.settle()
+    expect(calls()).toBe(1)
   },
 )
 
@@ -1565,17 +1801,12 @@ test(
   { options: { translateOutput: true, outputLanguage: 'zh' } },
   async ($, on) => {
     const source = 'This is the assistant reply.'
-    const signature = translationSignature({
-      inputLanguage: 'en',
-      outputLanguage: 'zh',
-      model: 'haiku',
-      translationRules: '',
-      promptVersion: PROMPT_TAG,
-    })
-    const key = cacheKey(signature, 'zh', 'output', source)
 
     mock.store(on, {
-      cache: { [key]: { status: 'translated', text: '这是助手的回复。' } },
+      [cacheEntryStoreKey(source)]: {
+        status: 'translated',
+        text: '这是助手的回复。',
+      },
     })
     registerRenderBottoms(on)
     const calls = installModel(on, () => 'should not be used')
@@ -1588,16 +1819,19 @@ test(
 )
 
 test(
-  '持久化缓存格式不合法时忽略并重新翻译',
+  '持久化条目格式不合法时忽略并重新翻译',
   { options: { translateOutput: true, outputLanguage: 'zh' } },
   async ($, on) => {
     const clock = mock.clock(on)
-    mock.store(on, { cache: { broken: { status: 'nope' } } })
+    const source = 'This is the assistant reply.'
+    mock.store(on, {
+      [cacheEntryStoreKey(source)]: { status: 'nope' },
+    })
     registerRenderBottoms(on)
     const calls = installModel(on, () => translated('这是助手的回复。'))
 
-    const first = await $.ui.render(assistantInput('This is the assistant reply.'))
-    expect(drawnText(first)).toBe('This is the assistant reply.')
+    const first = await $.ui.render(assistantInput(source))
+    expect(drawnText(first)).toBe(source)
 
     await clock.advance(1)
     await clock.settle()
@@ -1606,108 +1840,246 @@ test(
 )
 
 test(
-  'store 里没有缓存时只读一次，后续渲染不再重复读',
+  '持久化条目按 key 懒读一次，后续渲染不再访问 store',
   { options: { translateOutput: true, outputLanguage: 'zh' } },
   async ($, on) => {
-    // 读 store 发生在每条助手消息的渲染路径上；空缓存也必须记住，
-    // 否则每条消息都会再打一次跨会话的 store。
-    const clock = mock.clock(on)
-    let cacheReads = 0
-    on(
-      'store.get',
-      { key: 'cache' },
-      ($inner, e, next) => {
-        cacheReads += 1
-        return next(e)
-      },
-    )
-    mock.store(on)
+    // 读 store 发生在每条助手消息的渲染路径上；命中或确认缺失都必须记住，
+    // 否则同一条消息每次重绘都会再打一次跨会话的 store。
+    const source = 'This is the assistant reply.'
+    const storeKey = cacheEntryStoreKey(source)
+    const stored = new Map<string, unknown>([
+      [storeKey, { status: 'translated', text: '这是助手的回复。' }],
+    ])
+    let entryReads = 0
+    on('store.get', ($inner, e) => {
+      if (e.key === storeKey) entryReads += 1
+      return { value: stored.get(e.key) }
+    })
     registerRenderBottoms(on)
     installModel(on, () => translated('这是助手的回复。'))
 
-    await $.ui.render(assistantInput('First reply from the assistant.'))
-    await $.ui.render(assistantInput('Second reply from the assistant.'))
+    const first = await $.ui.render(assistantInput(source))
+    const second = await $.ui.render(assistantInput(source))
 
-    expect(cacheReads).toBe(1)
+    expect(drawnText(first)).toBe('这是助手的回复。')
+    expect(drawnText(second)).toBe('这是助手的回复。')
+    expect(entryReads).toBe(1)
+  },
+)
+
+test(
+  '持久化条目确认缺失后同 key 不再重复读 store',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    const clock = mock.clock(on)
+    const source = 'This reply is not cached anywhere.'
+    const storeKey = cacheEntryStoreKey(source)
+    let entryReads = 0
+    on('store.get', ($inner, e) => {
+      if (e.key === storeKey) entryReads += 1
+      return { value: undefined }
+    })
+    registerRenderBottoms(on)
+    installModel(on, () => translated('这是新翻的译文。'))
+
+    // 翻译定时器还没执行；两次渲染都必须记住“已确认缺失”，不再读 store。
+    const first = await $.ui.render(assistantInput(source))
+    const second = await $.ui.render(assistantInput(source))
+
+    expect(drawnText(first)).toBe(source)
+    expect(drawnText(second)).toBe(source)
+    expect(entryReads).toBe(1)
     await clock.settle()
   },
 )
 
 test(
-  '缓存读失败只是这一次失败，后续渲染会再试',
+  '持久化条目读失败不记为缺失，下次渲染会再试',
   { options: { translateOutput: true, outputLanguage: 'zh' } },
   async ($, on) => {
-    // 第一次读 store 被拒（临时故障）：不能当作永久空缓存，
-    // 否则本次会话再也不会跨会话复用旧译文。
+    // 第一次读 store 被拒（临时故障）：不能当作永久缺失，
+    // 否则本次会话再也不会跨会话复用这条译文。
     const clock = mock.clock(on)
-    let cacheReads = 0
-    on(
-      'store.get',
-      { key: 'cache' },
-      ($inner, e, next) => {
-        cacheReads += 1
-        if (cacheReads === 1) return { deny: 'transient-failure' }
-        return next(e)
-      },
-    )
-    mock.store(on)
+    const source = 'This is the assistant reply.'
+    let entryReads = 0
+    on('store.get', ($inner, e) => {
+      if (e.key !== cacheEntryStoreKey(source)) return { value: undefined }
+      entryReads += 1
+      if (entryReads === 1) return { deny: 'transient-failure' }
+      return { value: { status: 'translated', text: '跨会话的旧译文。' } }
+    })
     registerRenderBottoms(on)
     installModel(on, () => translated('这是助手的回复。'))
 
-    await $.ui.render(assistantInput('First reply from the assistant.'))
-    // 第一次读失败后不应记忆：第二次渲染还要再读一次 store。
-    await $.ui.render(assistantInput('Second reply from the assistant.'))
+    const first = await $.ui.render(assistantInput(source))
+    // 翻译定时器还没执行；这次渲染必须重新读 store 并显示读到的旧译文。
+    const second = await $.ui.render(assistantInput(source))
 
-    expect(cacheReads).toBe(2)
+    expect(drawnText(first)).toBe(source)
+    expect(drawnText(second)).toBe('跨会话的旧译文。')
+    expect(entryReads).toBe(2)
     await clock.settle()
   },
 )
 
 test(
-  '持久化缓存时会合并其他会话后写入的条目，不互相覆盖',
+  '逐条持久化不会覆盖其他会话写入的译文',
   { options: { translateOutput: true, outputLanguage: 'zh' } },
   async ($, on) => {
     const clock = mock.clock(on)
-    let storedCache: unknown
-    on('store.get', { key: 'cache' }, () => ({ value: storedCache }))
-    on('store.set', { key: 'cache' }, (_$, e) => {
-      storedCache = e.value
+    const stored = new Map<string, unknown>()
+    const writes: string[] = []
+    let legacyReads = 0
+    let legacyWrites = 0
+    on('store.get', ($inner, e) => {
+      if (e.key === 'cache') legacyReads += 1
+      return { value: stored.get(e.key) }
+    })
+    on('store.set', ($inner, e) => {
+      if (e.key === 'cache') legacyWrites += 1
+      else writes.push(e.key)
+      stored.set(e.key, e.value)
       return { value: undefined }
     })
     registerRenderBottoms(on)
     installModel(on, () => translated('这是本会话的译文。'))
 
-    const signature = translationSignature({
-      inputLanguage: 'en',
-      outputLanguage: 'zh',
-      model: 'haiku',
-      translationRules: '',
-      promptVersion: PROMPT_TAG,
-    })
     const localSource = 'Reply translated in this session.'
-    const localKey = cacheKey(signature, 'zh', 'output', localSource)
-    const externalKey = cacheKey(
-      signature,
-      'zh',
-      'output',
-      'Reply translated in another session.',
-    )
+    const externalSource = 'Reply translated in another session.'
+    const laterSource = 'Another reply translated in this session.'
+    const translatedText = '这是本会话的译文。'
+    const localStoreKey = cacheEntryStoreKey(localSource)
+    const externalStoreKey = cacheEntryStoreKey(externalSource)
+    const laterStoreKey = cacheEntryStoreKey(laterSource)
+    const localSizeKey = cacheSizeStoreKey(localSource, translatedText.length)
+    const laterSizeKey = cacheSizeStoreKey(laterSource, translatedText.length)
 
+    // 本会话写入 A。
     await $.ui.render(assistantInput(localSource))
+    await clock.advance(1)
+    await clock.settle()
+    await clock.advance(1000)
+    await clock.settle()
+    expect(stored.get(localStoreKey)).toEqual({
+      status: 'translated',
+      text: '这是本会话的译文。',
+    })
 
-    storedCache = {
-      [externalKey]: { status: 'translated', text: '另一会话的译文。' },
-    }
+    // 另一并发会话直接写入 B。
+    stored.set(externalStoreKey, {
+      status: 'translated',
+      text: '另一会话的译文。',
+    })
 
+    // 本会话再翻译一条 C，触发第二次持久化。
+    await $.ui.render(assistantInput(laterSource))
     await clock.advance(1)
     await clock.settle()
     await clock.advance(1000)
     await clock.settle()
 
-    expect(storedCache).toEqual({
-      [externalKey]: { status: 'translated', text: '另一会话的译文。' },
-      [localKey]: { status: 'translated', text: '这是本会话的译文。' },
+    // A、B、C 都在，且 B 没有被本会话的整表回写覆盖。
+    expect(stored.get(localStoreKey)).toEqual({
+      status: 'translated',
+      text: '这是本会话的译文。',
     })
+    expect(stored.get(externalStoreKey)).toEqual({
+      status: 'translated',
+      text: '另一会话的译文。',
+    })
+    expect(stored.get(laterStoreKey)).toEqual({
+      status: 'translated',
+      text: '这是本会话的译文。',
+    })
+    // 已写过的 A 不重写，本次只写新条目 C；每条正文后跟一个大小标记。
+    expect(writes).toEqual([
+      localStoreKey,
+      localSizeKey,
+      laterStoreKey,
+      laterSizeKey,
+    ])
+    expect(stored.get(localSizeKey)).toBe(translatedText.length)
+    expect(stored.get(laterSizeKey)).toBe(translatedText.length)
+    // 旧版整表 'cache' 键不再读写。
+    expect(legacyReads).toBe(0)
+    expect(legacyWrites).toBe(0)
+  },
+)
+
+test(
+  '单条持久化写入失败不记为已写，下次持久化会重试',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    const clock = mock.clock(on)
+    const stored = new Map<string, unknown>()
+    const writes: string[] = []
+    let denyNextWrite = true
+    on('store.get', ($inner, e) => ({ value: stored.get(e.key) }))
+    on('store.set', ($inner, e) => {
+      writes.push(e.key)
+      if (denyNextWrite) {
+        denyNextWrite = false
+        return { deny: 'disk-full' }
+      }
+      stored.set(e.key, e.value)
+      return { value: undefined }
+    })
+    registerRenderBottoms(on)
+    installModel(on, () => translated('这是本会话的译文。'))
+
+    const firstSource = 'First reply of the batch.'
+    const secondSource = 'Second reply of the batch.'
+    const laterSource = 'Third reply after the failure.'
+    const translatedText = '这是本会话的译文。'
+    const firstKey = cacheEntryStoreKey(firstSource)
+    const secondKey = cacheEntryStoreKey(secondSource)
+    const laterKey = cacheEntryStoreKey(laterSource)
+    const firstSizeKey = cacheSizeStoreKey(firstSource, translatedText.length)
+    const secondSizeKey = cacheSizeStoreKey(secondSource, translatedText.length)
+    const laterSizeKey = cacheSizeStoreKey(laterSource, translatedText.length)
+
+    // 同一批翻译 A、B：第一次写 A 失败，B 仍要写入。
+    await $.ui.render(assistantInput(firstSource))
+    await $.ui.render(assistantInput(secondSource))
+    await clock.advance(1)
+    await clock.settle()
+    await clock.advance(1000)
+    await clock.settle()
+
+    expect(stored.has(firstKey)).toBe(false)
+    expect(stored.has(firstSizeKey)).toBe(false)
+    expect(stored.get(secondKey)).toEqual({
+      status: 'translated',
+      text: translatedText,
+    })
+    expect(stored.get(secondSizeKey)).toBe(translatedText.length)
+
+    // 下一条翻译触发持久化：失败的 A 正文和标记都重试，成功的 B 不重写。
+    await $.ui.render(assistantInput(laterSource))
+    await clock.advance(1)
+    await clock.settle()
+    await clock.advance(1000)
+    await clock.settle()
+
+    expect(stored.get(firstKey)).toEqual({
+      status: 'translated',
+      text: translatedText,
+    })
+    expect(stored.get(firstSizeKey)).toBe(translatedText.length)
+    expect(stored.get(laterKey)).toEqual({
+      status: 'translated',
+      text: translatedText,
+    })
+    expect(stored.get(laterSizeKey)).toBe(translatedText.length)
+    expect(writes).toEqual([
+      firstKey,
+      secondKey,
+      secondSizeKey,
+      firstKey,
+      firstSizeKey,
+      laterKey,
+      laterSizeKey,
+    ])
   },
 )
 
@@ -1717,8 +2089,8 @@ test(
   async ($, on) => {
     const clock = mock.clock(on)
     let persistCalls = 0
-    on('store.get', { key: 'cache' }, () => ({ value: undefined }))
-    on('store.set', { key: 'cache' }, () => {
+    on('store.get', () => ({ value: undefined }))
+    on('store.set', () => {
       persistCalls += 1
       return { value: undefined }
     })
@@ -1737,39 +2109,396 @@ test(
 )
 
 test(
-  'session.start 再次触发时会重新读取 store 里的新缓存，不复用旧内存缓存',
+  'session.start 再次触发时丢弃旧的按需读取结果，能看到其他会话新写入的译文',
   { options: { translateOutput: true, outputLanguage: 'zh' } },
   async ($, on) => {
     const source = 'Reply persisted by another session.'
-    const signature = translationSignature({
-      inputLanguage: 'en',
-      outputLanguage: 'zh',
-      model: 'haiku',
-      translationRules: '',
-      promptVersion: PROMPT_TAG,
+    const storeKey = cacheEntryStoreKey(source)
+    const stored = new Map<string, unknown>([
+      [storeKey, { status: 'translated', text: '旧译文。' }],
+    ])
+    on('store.get', ($inner, e) => ({ value: stored.get(e.key) }))
+    on('store.set', ($inner, e) => {
+      stored.set(e.key, e.value)
+      return { value: undefined }
     })
-    const key = cacheKey(signature, 'zh', 'output', source)
-
-    let storedCache: Record<string, unknown> = {}
-    on('store.get', { key: 'cache' }, () => ({ value: storedCache }))
+    on('store.keys', () => ({ value: [...stored.keys()] }))
     on('session.start', ($inner, e) => e)
     registerRenderBottoms(on)
     const calls = installModel(on, () => 'should not be used')
 
-    // 首次启动时 store 为空，内存里的 persistedCache 会记下空表。
-    await $.session.start({ cwd: '.' })
+    await $.session.start(sessionStartInput('.'))
+    const first = await $.ui.render(assistantInput(source))
+    expect(drawnText(first)).toBe('旧译文。')
 
-    // 另一并发会话随后写入了新缓存条目。
-    storedCache = {
-      [key]: { status: 'translated', text: '其他会话新写入的译文。' },
+    // 本会话已确认过这个 key，其他会话随后改写了 store，渲染仍用已读结果。
+    stored.set(storeKey, { status: 'translated', text: '新译文。' })
+    const cached = await $.ui.render(assistantInput(source))
+    expect(drawnText(cached)).toBe('旧译文。')
+
+    // 再次 session.start 后按需读取结果作废，重新读 store 得到新译文。
+    await $.session.start(sessionStartInput('.'))
+
+    const refreshed = await $.ui.render(assistantInput(source))
+    expect(drawnText(refreshed)).toBe('新译文。')
+    expect(calls()).toBe(0)
+  },
+)
+
+test(
+  '新会话启动时按上限修剪 store 里最旧的译文条目',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    on('session.start', ($inner, e) => e)
+    const entries = new Map<string, unknown>()
+    for (let index = 0; index < 301; index += 1) {
+      const text = `译文 ${index}`
+      entries.set(`cache-entry:k-${index}`, {
+        status: 'translated',
+        text,
+      })
+      entries.set(
+        storedCacheEntrySizeKey(`k-${index}`, text.length),
+        text.length,
+      )
+    }
+    let keysCalls = 0
+    const deleted: string[] = []
+    on('store.keys', () => {
+      keysCalls += 1
+      return { value: [...entries.keys()] }
+    })
+    on('store.get', ($inner, e) => ({ value: entries.get(e.key) }))
+    on('store.delete', ($inner, e) => {
+      deleted.push(e.key)
+      entries.delete(e.key)
+      return { value: undefined }
+    })
+
+    await $.session.start(sessionStartInput('.'))
+
+    // 原文修剪和译文修剪复用同一次 keys() 调用。
+    expect(keysCalls).toBe(1)
+    // keys() 按插入顺序返回：301 条里只删最旧的一条，连同大小标记。
+    expect(deleted).toEqual([
+      'cache-entry:k-0',
+      storedCacheEntrySizeKey('k-0', '译文 0'.length),
+    ])
+    expect(entries.get('cache-entry:k-300')).toEqual({
+      status: 'translated',
+      text: '译文 300',
+    })
+    expect(entries.has(storedCacheEntrySizeKey('k-1', '译文 1'.length))).toBe(
+      true,
+    )
+  },
+)
+
+test(
+  '新会话启动时按字符上限修剪最旧的译文和大小标记',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    on('session.start', ($inner, e) => e)
+    const entries = new Map<string, unknown>()
+    const text = 'x'.repeat(100_000)
+    // 12 × 10 万字符超过 100 万上限，最旧的两条及其标记应被删除。
+    for (let index = 0; index < 12; index += 1) {
+      const entryKey = `k-${index}`
+      entries.set(`cache-entry:${entryKey}`, {
+        status: 'translated',
+        text,
+      })
+      entries.set(storedCacheEntrySizeKey(entryKey, text.length), text.length)
+    }
+    // 同一正文的旧标记（并发重写）按最大长度计费，淘汰标记时一并清理。
+    const staleMarker = storedCacheEntrySizeKey('k-11', 50_000)
+    entries.set(staleMarker, 50_000)
+    // 正文已不存在的孤儿标记也要清掉。
+    const orphanMarker = storedCacheEntrySizeKey('gone', 1234)
+    entries.set(orphanMarker, 1234)
+
+    let keysCalls = 0
+    let entryReads = 0
+    const deleted: string[] = []
+    on('store.keys', () => {
+      keysCalls += 1
+      return { value: [...entries.keys()] }
+    })
+    on('store.get', ($inner, e) => {
+      if (e.key.startsWith('cache-entry:')) entryReads += 1
+      return { value: entries.get(e.key) }
+    })
+    on('store.delete', ($inner, e) => {
+      deleted.push(e.key)
+      entries.delete(e.key)
+      return { value: undefined }
+    })
+
+    await $.session.start(sessionStartInput('.'))
+
+    expect(keysCalls).toBe(1)
+    // 修剪只靠 key 名里的字符数，不读取任何译文正文。
+    expect(entryReads).toBe(0)
+    expect(deleted).toEqual([
+      'cache-entry:k-0',
+      storedCacheEntrySizeKey('k-0', text.length),
+      'cache-entry:k-1',
+      storedCacheEntrySizeKey('k-1', text.length),
+      staleMarker,
+      orphanMarker,
+    ])
+    expect(entries.has('cache-entry:k-2')).toBe(true)
+    expect(entries.has(storedCacheEntrySizeKey('k-2', text.length))).toBe(true)
+    expect(entries.size).toBe(20)
+  },
+)
+
+test('没有大小标记的旧条目按 0 字符计，但仍受条数上限约束', {}, async () => {
+  // 有标记的 10 条正好 100 万字符；无标记的旧条目正文再长也不计入字符预算。
+  const keys: string[] = []
+  for (let index = 0; index < 10; index += 1) {
+    keys.push(`cache-entry:k-${index}`)
+    keys.push(storedCacheEntrySizeKey(`k-${index}`, 100_000))
+  }
+  keys.push('cache-entry:legacy')
+  expect(excessCacheKeys(keys)).toEqual([])
+
+  // 无标记条目仍占条目名额：301 条只淘汰最旧的一条。
+  const many: string[] = []
+  for (let index = 0; index < 301; index += 1) {
+    many.push(`cache-entry:n-${index}`)
+  }
+  expect(excessCacheKeys(many)).toEqual(['cache-entry:n-0'])
+})
+
+test('按需读取表超过条数或字符上限时淘汰最旧结果', {}, async () => {
+  // 条数上限：305 条短译文只保留最新的 300 条。
+  const byCount = createStorageState()
+  for (let index = 0; index < 305; index += 1) {
+    rememberPersistedEntry(byCount, `k-${index}`, {
+      status: 'translated',
+      text: `译文 ${index}`,
+    })
+  }
+  expect(byCount.persistedEntries.size).toBe(300)
+  expect(byCount.persistedEntries.has('k-0')).toBe(false)
+  expect(byCount.persistedEntries.has('k-4')).toBe(false)
+  expect(byCount.persistedEntries.get('k-304')).toEqual({
+    status: 'translated',
+    text: '译文 304',
+  })
+
+  // 字符上限：12 × 10 万字符只保留最新的 10 条。
+  const byChars = createStorageState()
+  const longText = '字'.repeat(100_000)
+  for (let index = 0; index < 12; index += 1) {
+    rememberPersistedEntry(byChars, `k-${index}`, {
+      status: 'translated',
+      text: longText,
+    })
+  }
+  expect(byChars.persistedEntries.size).toBe(10)
+  expect(byChars.persistedEntries.has('k-0')).toBe(false)
+  expect(byChars.persistedEntries.has('k-1')).toBe(false)
+  expect(byChars.persistedEntries.get('k-11')).toBeDefined()
+
+  // null（已确认缺失）不占字符预算，但仍占 300 条名额。
+  const withNulls = createStorageState()
+  for (let index = 0; index < 300; index += 1) {
+    rememberPersistedEntry(withNulls, `missing-${index}`, null)
+  }
+  rememberPersistedEntry(withNulls, 'fresh', {
+    status: 'translated',
+    text: '新译文',
+  })
+  expect(withNulls.persistedEntries.size).toBe(300)
+  expect(withNulls.persistedEntries.has('missing-0')).toBe(false)
+  expect(withNulls.persistedEntries.get('fresh')).toEqual({
+    status: 'translated',
+    text: '新译文',
+  })
+})
+
+test('持久化前只保留当前缓存里还存在的去重 key', {}, async () => {
+  const entries: Record<string, { status: 'translated'; text: string }> = {}
+  const persistedKeys = new Set<string>()
+  for (let index = 0; index < 300; index += 1) {
+    const key = `k-${index}`
+    entries[key] = { status: 'translated', text: `译文 ${index}` }
+    persistedKeys.add(key)
+  }
+  // 原子缓存淘汰了最旧的 5 条：对应去重 key 一并忘记。
+  for (let index = 0; index < 5; index += 1) {
+    delete entries[`k-${index}`]
+  }
+
+  retainPersistedKeys(persistedKeys, entries)
+
+  expect(persistedKeys.size).toBe(295)
+  expect(persistedKeys.has('k-0')).toBe(false)
+  expect(persistedKeys.has('k-4')).toBe(false)
+  expect(persistedKeys.has('k-5')).toBe(true)
+  expect(persistedKeys.has('k-299')).toBe(true)
+})
+
+test(
+  '长会话持久化时忘记已淘汰的去重 key，且不重写仍在缓存的译文',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    const clock = mock.clock(on)
+    const stored = new Map<string, unknown>()
+    const bodyWrites: string[] = []
+    on('store.get', ($inner, e) => ({ value: stored.get(e.key) }))
+    on('store.set', ($inner, e) => {
+      stored.set(e.key, e.value)
+      if (e.key.startsWith('cache-entry:')) bodyWrites.push(e.key)
+      return { value: undefined }
+    })
+    registerRenderBottoms(on)
+    installModel(on, () => translated('这是助手的回复。'))
+
+    const source = (index: number) => `Reply ${index}.`
+    const persistBatch = async (from: number, to: number) => {
+      for (let index = from; index < to; index += 1) {
+        await $.ui.render(assistantInput(source(index)))
+      }
+      await clock.advance(1)
+      await clock.settle()
+      await clock.advance(1000)
+      await clock.settle()
     }
 
-    // 再次触发 session.start 时应重置内存缓存并重新读取 store。
-    await $.session.start({ cwd: '.' })
+    // 第一批 200 条全部入库。
+    await persistBatch(0, 200)
+    expect(bodyWrites.length).toBe(200)
 
-    const tree = await $.ui.render(assistantInput(source))
-    expect(drawnText(tree)).toBe('其他会话新写入的译文。')
-    expect(calls()).toBe(0)
+    // 第二批 150 条：原子缓存只留最新 300 条，最旧 50 条被淘汰。
+    await persistBatch(200, 350)
+    // 只写本批 150 条新译文，仍在新缓存里的前 150 条不重写。
+    expect(bodyWrites.length).toBe(350)
+    expect(bodyWrites.slice(200)).toEqual(
+      Array.from({ length: 150 }, (_, offset) =>
+        cacheEntryStoreKey(source(200 + offset)),
+      ),
+    )
+
+    // 再翻一条：缓存里保留的译文仍不重写，只写新条目。
+    await persistBatch(350, 351)
+    expect(bodyWrites.length).toBe(351)
+    expect(bodyWrites.at(-1)).toBe(cacheEntryStoreKey(source(350)))
+
+    // 已淘汰的 key 重新回到缓存时应重新写入，说明去重集合确实忘了它。
+    const reclaimedKey = cacheEntryStoreKey(source(0))
+    stored.delete(reclaimedKey)
+    stored.delete(cacheSizeStoreKey(source(0), '这是助手的回复。'.length))
+    await persistBatch(0, 1)
+    expect(bodyWrites.at(-1)).toBe(reclaimedKey)
+    expect(stored.get(reclaimedKey)).toEqual({
+      status: 'translated',
+      text: '这是助手的回复。',
+    })
+  },
+)
+
+test(
+  '持久化译文时写入大小标记且不碰旧版整表 cache 键',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    const clock = mock.clock(on)
+    const stored = new Map<string, unknown>()
+    let legacyReads = 0
+    let legacyWrites = 0
+    on('store.get', ($inner, e) => {
+      if (e.key === 'cache') legacyReads += 1
+      return { value: stored.get(e.key) }
+    })
+    on('store.set', ($inner, e) => {
+      if (e.key === 'cache') legacyWrites += 1
+      stored.set(e.key, e.value)
+      return { value: undefined }
+    })
+    registerRenderBottoms(on)
+    installModel(on, () => translated('这是助手的回复。'))
+
+    const source = 'This is the assistant reply.'
+    const translatedText = '这是助手的回复。'
+    await $.ui.render(assistantInput(source))
+    await clock.advance(1)
+    await clock.settle()
+    await clock.advance(1000)
+    await clock.settle()
+
+    expect(stored.get(cacheEntryStoreKey(source))).toEqual({
+      status: 'translated',
+      text: translatedText,
+    })
+    expect(stored.get(cacheSizeStoreKey(source, translatedText.length))).toBe(
+      translatedText.length,
+    )
+    // 旧版整表 'cache' 键仍然不读不写。
+    expect(legacyReads).toBe(0)
+    expect(legacyWrites).toBe(0)
+  },
+)
+
+test(
+  '大小标记写入失败时整条不记为已写，下次持久化补写',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    const clock = mock.clock(on)
+    const stored = new Map<string, unknown>()
+    const writes: string[] = []
+    let denyMarker = true
+    on('store.get', ($inner, e) => ({ value: stored.get(e.key) }))
+    on('store.set', ($inner, e) => {
+      writes.push(e.key)
+      if (denyMarker && e.key.startsWith('cache-entry-size:')) {
+        denyMarker = false
+        return { deny: 'disk-full' }
+      }
+      stored.set(e.key, e.value)
+      return { value: undefined }
+    })
+    registerRenderBottoms(on)
+    installModel(on, () => translated('这是本会话的译文。'))
+
+    const firstSource = 'First reply with a failed size marker.'
+    const laterSource = 'Later reply that triggers a retry.'
+    const translatedText = '这是本会话的译文。'
+    const firstKey = cacheEntryStoreKey(firstSource)
+    const laterKey = cacheEntryStoreKey(laterSource)
+    const firstSizeKey = cacheSizeStoreKey(firstSource, translatedText.length)
+    const laterSizeKey = cacheSizeStoreKey(laterSource, translatedText.length)
+
+    await $.ui.render(assistantInput(firstSource))
+    await clock.advance(1)
+    await clock.settle()
+    await clock.advance(1000)
+    await clock.settle()
+
+    // 正文写成功但标记失败：不能记为已写。
+    expect(stored.get(firstKey)).toEqual({
+      status: 'translated',
+      text: translatedText,
+    })
+    expect(stored.has(firstSizeKey)).toBe(false)
+
+    await $.ui.render(assistantInput(laterSource))
+    await clock.advance(1)
+    await clock.settle()
+    await clock.advance(1000)
+    await clock.settle()
+
+    expect(stored.get(firstSizeKey)).toBe(translatedText.length)
+    expect(stored.get(laterSizeKey)).toBe(translatedText.length)
+    expect(writes).toEqual([
+      firstKey,
+      firstSizeKey,
+      firstKey,
+      firstSizeKey,
+      laterKey,
+      laterSizeKey,
+    ])
   },
 )
 
@@ -1904,10 +2633,9 @@ test(
     registerRenderBottoms(on)
     const calls = installModel(on, () => translated('这是助手的回复。'))
 
-    const reply = await $.command.run({
-      command: 'translator',
-      args: 'output en',
-    })
+    const reply = await $.command.run(
+      commandRunInput('translator', 'output en'),
+    )
     expect(reply.text).toContain('outputLanguage=en')
 
     const source = 'This is the assistant reply.'
@@ -1939,14 +2667,14 @@ test(
     expect(calls()).toBe(0)
 
     // 译文还在排队时切到日文；排队任务应仍按渲染时的中文设置翻译。
-    await $.command.run({ command: 'translator', args: 'output ja' })
+    await $.command.run(commandRunInput('translator', 'output ja'))
 
     await clock.advance(1)
     await clock.settle()
     expect(calls()).toBe(1)
 
     // 切回中文后，旧 key 里必须是中文译文，而不是排队期间新设置的日文译文。
-    await $.command.run({ command: 'translator', args: 'output zh' })
+    await $.command.run(commandRunInput('translator', 'output zh'))
     const second = await $.ui.render(assistantInput(source))
     expect(drawnText(second)).toBe('这是中文译文。')
   },
@@ -1962,7 +2690,7 @@ test(
       return { text: '' }
     })
 
-    await $.command.run({ command: 'btw', args: '解释一下这个函数' })
+    await $.command.run(commandRunInput('btw', '解释一下这个函数'))
 
     expect(args).toContain('解释一下这个函数')
     expect(args).toContain('Answer in Simplified Chinese')
@@ -1984,6 +2712,7 @@ test(
       '/pstack:poteto-mode 优化千牛登录流程的整体速度，现在用户点击登录后在工作台 -> 接待中心 的流程动作延迟很大'
     await $.prompt.submit({
       text: line,
+      wait: false,
       origin: { kind: 'composer' },
     })
 
@@ -2007,6 +2736,7 @@ test(
 
     await $.prompt.submit({
       text: '/tmp/中文目录 怎么清理',
+      wait: false,
       origin: { kind: 'composer' },
     })
 
@@ -2030,10 +2760,9 @@ test(
       return { text: '' }
     })
 
-    await $.command.run({
-      command: 'pstack:poteto-mode',
-      args: '优化千牛登录流程的整体速度',
-    })
+    await $.command.run(
+      commandRunInput('pstack:poteto-mode', '优化千牛登录流程的整体速度'),
+    )
 
     expect(calls()).toBe(1)
     expect(receivedCommand).toBe('pstack:poteto-mode')
@@ -2054,10 +2783,147 @@ test(
       return { text: '' }
     })
 
-    await $.command.run({ command: 'rename', args: '登录优化会话' })
+    await $.command.run(commandRunInput('rename', '登录优化会话'))
 
     expect(calls()).toBe(0)
     expect(receivedArgs).toBe('登录优化会话')
+  },
+)
+
+test(
+  'command.run 对纯机器参数不调用模型也不改写参数',
+  { options: { translateInput: true, inputLanguage: 'zh' } },
+  async ($, on) => {
+    const calls = installModel(on, () => translated('should not translate'))
+    let receivedArgs = ''
+    on('command.run', { command: 'custom:machine' }, ($, e) => {
+      receivedArgs = e.args
+      return { text: '' }
+    })
+
+    await $.command.run(commandRunInput('custom:machine', '5m /review'))
+
+    expect(calls()).toBe(0)
+    expect(receivedArgs).toBe('5m /review')
+  },
+)
+
+test(
+  'command.run 自定义规则下机器参数仍不翻译',
+  {
+    options: {
+      translateInput: true,
+      inputLanguage: 'en',
+      translationRules: '- 保留术语',
+    },
+  },
+  async ($, on) => {
+    const calls = installModel(on, () => translated('should not translate'))
+    let receivedArgs = ''
+    on('command.run', { command: 'custom:machine' }, ($, e) => {
+      receivedArgs = e.args
+      return { text: '' }
+    })
+
+    await $.command.run(commandRunInput('custom:machine', '--fix'))
+
+    expect(calls()).toBe(0)
+    expect(receivedArgs).toBe('--fix')
+  },
+)
+
+test(
+  'command.run 机器参数与正文混排时仍翻译正文',
+  { options: { translateInput: true, inputLanguage: 'en' } },
+  async ($, on) => {
+    const calls = installModel(on, () =>
+      translated('Optimize the login flow within 5 minutes'),
+    )
+    let receivedArgs = ''
+    on('command.run', { command: 'pstack:poteto-mode' }, ($, e) => {
+      receivedArgs = e.args
+      return { text: '' }
+    })
+
+    await $.command.run(
+      commandRunInput('pstack:poteto-mode', '5m 优化千牛登录流程'),
+    )
+
+    expect(calls()).toBe(1)
+    expect(receivedArgs).toBe('Optimize the login flow within 5 minutes')
+  },
+)
+
+test(
+  'command.run 跳过 loop 命令，机器参数原样传递',
+  { options: { translateInput: true, inputLanguage: 'zh' } },
+  async ($, on) => {
+    const calls = installModel(on, () => translated('should not translate'))
+    let receivedArgs = ''
+    on('command.run', { command: 'loop' }, ($, e) => {
+      receivedArgs = e.args
+      return { text: '' }
+    })
+
+    await $.command.run(commandRunInput('loop', '5m /review'))
+
+    expect(calls()).toBe(0)
+    expect(receivedArgs).toBe('5m /review')
+  },
+)
+
+test(
+  'command.run 跳过 run 命令，普通命令参数原样传递',
+  { options: { translateInput: true, inputLanguage: 'zh' } },
+  async ($, on) => {
+    const calls = installModel(on, () => translated('should not translate'))
+    let receivedArgs = ''
+    on('command.run', { command: 'run' }, ($, e) => {
+      receivedArgs = e.args
+      return { text: '' }
+    })
+
+    await $.command.run(commandRunInput('run', 'npm test'))
+
+    expect(calls()).toBe(0)
+    expect(receivedArgs).toBe('npm test')
+  },
+)
+
+test(
+  'command.run 识别时长、相对路径、Windows 路径和 key=value 参数',
+  { options: { translateInput: true, inputLanguage: 'zh' } },
+  async ($, on) => {
+    const calls = installModel(on, () => translated('should not translate'))
+    let receivedArgs = ''
+    on('command.run', { command: 'custom:machine' }, ($, e) => {
+      receivedArgs = e.args
+      return { text: '' }
+    })
+
+    const args = '2.5h ./x ../x C:\\x key=value'
+    await $.command.run(commandRunInput('custom:machine', args))
+
+    expect(calls()).toBe(0)
+    expect(receivedArgs).toBe(args)
+  },
+)
+
+test(
+  'command.run 未知命令的普通单词参数仍翻译，序号不算时长',
+  { options: { translateInput: true, inputLanguage: 'zh' } },
+  async ($, on) => {
+    const calls = installModel(on, () => translated('运行测试'))
+    let receivedArgs = ''
+    on('command.run', { command: 'custom:machine' }, ($, e) => {
+      receivedArgs = e.args
+      return { text: '' }
+    })
+
+    await $.command.run(commandRunInput('custom:machine', '3rd npm test'))
+
+    expect(calls()).toBe(1)
+    expect(receivedArgs).toBe('运行测试')
   },
 )
 
@@ -2068,8 +2934,8 @@ test(
     on('model.complete', () => ({
       value: {
         isAnswered: false as const,
-        reason: 'network error',
-        usage: { input_tokens: 0, output_tokens: 0 },
+        reason: 'empty-reply' as const,
+        usage: USAGE,
       },
     }))
     let ran = false
@@ -2078,10 +2944,9 @@ test(
       return { text: '' }
     })
 
-    const reply = await $.command.run({
-      command: 'pstack:poteto-mode',
-      args: '优化千牛登录流程',
-    })
+    const reply = await $.command.run(
+      commandRunInput('pstack:poteto-mode', '优化千牛登录流程'),
+    )
 
     expect(ran).toBe(false)
     expect(reply.text).toContain('命令参数翻译失败')
@@ -2094,10 +2959,7 @@ test(
   async ($, on) => {
     mock.store(on)
 
-    const reply = await $.command.run({
-      command: 'translator',
-      args: 'status',
-    })
+    const reply = await $.command.run(commandRunInput('translator', 'status'))
 
     expect(reply.text).toContain('model=sonnet')
     expect(reply.text).toContain('inputLanguage=en')
@@ -2111,56 +2973,103 @@ test(
   async ($, on) => {
     mock.store(on)
 
-    const changed = await $.command.run({
-      command: 'translator',
-      args: 'output en',
-    })
+    const changed = await $.command.run(
+      commandRunInput('translator', 'output en'),
+    )
     expect(changed.text).toContain('outputLanguage=en')
 
-    const reset = await $.command.run({
-      command: 'translator',
-      args: 'reset',
-    })
+    const reset = await $.command.run(commandRunInput('translator', 'reset'))
     expect(reset.text).toContain('outputLanguage=ja')
     expect(reset.text).toContain('model=sonnet')
 
-    const status = await $.command.run({
-      command: 'translator',
-      args: 'status',
-    })
+    const status = await $.command.run(commandRunInput('translator', 'status'))
     expect(status.text).toContain('outputLanguage=ja')
     expect(status.text).toContain('model=sonnet')
   },
 )
 
 test(
-  '持久化缓存里的失败条目不再让原文永久停在原文',
+  '持久化缓存里的失败条目按缺失处理，重新翻译后覆盖同一个键',
   { options: { translateOutput: true, outputLanguage: 'zh' } },
   async ($, on) => {
     const clock = mock.clock(on)
     const source = 'This is the assistant reply.'
-    const signature = translationSignature({
-      inputLanguage: 'en',
-      outputLanguage: 'zh',
-      model: 'haiku',
-      translationRules: '',
-      promptVersion: PROMPT_TAG,
-    })
-    const key = cacheKey(signature, 'zh', 'output', source)
-
-    mock.store(on, {
-      cache: { [key]: { status: 'failed', reason: 'malformed-response: x' } },
+    const storeKey = cacheEntryStoreKey(source)
+    const stored = new Map<string, unknown>([
+      [storeKey, { status: 'failed', reason: 'malformed-response: x' }],
+    ])
+    on('store.get', ($inner, e) => ({ value: stored.get(e.key) }))
+    on('store.set', ($inner, e) => {
+      stored.set(e.key, e.value)
+      return { value: undefined }
     })
     registerRenderBottoms(on)
     const calls = installModel(on, () => translated('这是助手的回复。'))
 
-    await $.ui.render(assistantInput(source))
+    const first = await $.ui.render(assistantInput(source))
+    expect(drawnText(first)).toBe(source)
+
     await clock.advance(1)
+    await clock.settle()
+    await clock.advance(1000)
     await clock.settle()
 
     const second = await $.ui.render(assistantInput(source))
     expect(drawnText(second)).toBe('这是助手的回复。')
     expect(calls()).toBe(1)
+    expect(stored.get(storeKey)).toEqual({
+      status: 'translated',
+      text: '这是助手的回复。',
+    })
+  },
+)
+
+test(
+  '内存里的失败条目会重查 store，其他会话成功后重绘显示译文',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    // A 会话翻译失败后留下失败条目和负缓存；B 会话随后用同一个 key 成功持久化。
+    // A 重绘不能一直被失败条目挡住，但也不能因此重新调用模型。
+    const clock = mock.clock(on)
+    const source = 'This reply fails to parse in this session.'
+    const stored = new Map<string, unknown>()
+    let storeKey: string | undefined
+    let entryReads = 0
+    on('store.get', ($inner, e) => {
+      if (!e.key.startsWith('cache-entry:')) return { value: undefined }
+      storeKey = e.key
+      entryReads += 1
+      return { value: stored.get(e.key) }
+    })
+    registerRenderBottoms(on)
+    const calls = installModel(on, () => 'not json')
+
+    // A：首次渲染未命中并记下缺失，翻译失败后失败条目留在内存里。
+    const first = await $.ui.render(assistantInput(source))
+    expect(drawnText(first)).toBe(source)
+    await clock.advance(1)
+    await clock.settle()
+    expect(calls()).toBe(2)
+    expect(storeKey).toBeDefined()
+    expect(entryReads).toBe(1)
+
+    // B 写入之前 A 再重绘：store 仍为空，重查后保留失败条目，不重新翻译。
+    const early = await $.ui.render(assistantInput(source))
+    expect(drawnText(early)).toBe(source)
+    expect(entryReads).toBe(2)
+    await clock.advance(1)
+    await clock.settle()
+    expect(calls()).toBe(2)
+
+    // B 用 A 首次读取的同一个 key 成功翻译并持久化。
+    stored.set(storeKey!, { status: 'translated', text: '其他会话的译文。' })
+
+    // A 重绘：显示 B 的译文，模型调用次数不变。
+    const recovered = await $.ui.render(assistantInput(source))
+    expect(drawnText(recovered)).toBe('其他会话的译文。')
+    await clock.advance(1)
+    await clock.settle()
+    expect(calls()).toBe(2)
   },
 )
 
@@ -2179,12 +3088,9 @@ test(
       },
     })
     on('session.start', ($inner, e) => e)
-    await $.session.start({ cwd: '.' })
+    await $.session.start(sessionStartInput('.'))
 
-    const reply = await $.command.run({
-      command: 'translator',
-      args: 'status',
-    })
+    const reply = await $.command.run(commandRunInput('translator', 'status'))
 
     expect(reply.text).toContain('translateInput=false')
     expect(reply.text).toContain('inputLanguage=ja')
@@ -2208,12 +3114,9 @@ test(
       },
     })
     on('session.start', ($inner, e) => e)
-    await $.session.start({ cwd: '.' })
+    await $.session.start(sessionStartInput('.'))
 
-    const reply = await $.command.run({
-      command: 'translator',
-      args: 'status',
-    })
+    const reply = await $.command.run(commandRunInput('translator', 'status'))
 
     expect(reply.text).toContain('translateInput=true')
     expect(reply.text).toContain('inputLanguage=en')
@@ -2231,12 +3134,9 @@ test(
   async ($, on) => {
     mock.store(on, { settings: { inputLanguage: 'ja' } })
     on('session.start', ($inner, e) => e)
-    await $.session.start({ cwd: '.' })
+    await $.session.start(sessionStartInput('.'))
 
-    const reply = await $.command.run({
-      command: 'translator',
-      args: 'status',
-    })
+    const reply = await $.command.run(commandRunInput('translator', 'status'))
 
     expect(reply.text).toContain('inputLanguage=ja')
     expect(reply.text).toContain('outputLanguage=fr')
@@ -2338,3 +3238,89 @@ test('同一 key 已调度时返回 busy，不重复启动', {}, async () => {
   expect(scheduleTranslation(clock, key, start)).toBe('busy')
   expect(started).toBe(1)
 })
+
+test(
+  '读缓存期间切换输出语言，选择项译文仍按进入时的语言生成并复用同一个键',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    const clock = mock.clock(on)
+    const shownQuestions: string[] = []
+
+    on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
+      const first = (e.questions as Array<Record<string, unknown>>)[0]
+      shownQuestions.push(String(first?.question))
+      return { result: { questions: e.questions, answers: {} } }
+    })
+
+    // 第一次读缓存条目时挂起，让测试在 await 窗口内切换输出语言。
+    let entered = () => {}
+    const enteredPromise = new Promise<void>(resolve => {
+      entered = resolve
+    })
+    let release = () => {}
+    const gate = new Promise<void>(resolve => {
+      release = resolve
+    })
+    let firstEntryRead = true
+
+    on('store.get', (_$inner, e) => {
+      if (e.key.startsWith('cache-entry:') && firstEntryRead) {
+        firstEntryRead = false
+        entered()
+        return gate.then(() => ({ value: undefined }))
+      }
+      return { value: undefined }
+    })
+
+    const systems: string[] = []
+    const calls = installModel(on, (_source, system) => {
+      systems.push(system)
+      return system.includes('Japanese')
+        ? '{"translations":["どのライブラリ？","ライブラリ","甲","最初の選択肢。","乙","二番目の選択肢。"]}'
+        : '{"translations":["用哪个库？","库","甲","第一个选项。","乙","第二个选项。"]}'
+    })
+
+    const questions = [
+      {
+        question: 'Which library?',
+        header: 'Library',
+        multiSelect: false,
+        options: [
+          { label: 'Alpha', description: 'First option.' },
+          { label: 'Beta', description: 'Second option.' },
+        ],
+      },
+    ]
+
+    const pendingCall = $.tool.call({ tool: 'AskUserQuestion', questions })
+    await enteredPromise
+
+    try {
+      const switched = await $.command.run(
+        commandRunInput('translator', 'output ja'),
+      )
+      expect(switched.text).toContain('outputLanguage=ja')
+    } finally {
+      release()
+    }
+    await pendingCall
+
+    // key 和译文参数来自同一份快照：模型收到的仍是中文提示，不是切换后的日文。
+    expect(calls()).toBe(1)
+    expect(systems[0]).toContain('into Simplified Chinese')
+    expect(systems[0]).not.toContain('Japanese')
+    expect(shownQuestions).toEqual(['用哪个库？'])
+
+    await clock.advance(1)
+    await clock.settle()
+
+    // 切回中文再打开同一对话框：命中快照写入的缓存，不再调用模型。
+    await $.command.run(commandRunInput('translator', 'output zh'))
+    const second = await $.tool.call({ tool: 'AskUserQuestion', questions })
+    expect(calls()).toBe(1)
+    expect(shownQuestions).toEqual(['用哪个库？', '用哪个库？'])
+    expect(
+      (second as { result: { questions: unknown } }).result.questions,
+    ).toEqual(questions)
+  },
+)

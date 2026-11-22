@@ -6,6 +6,10 @@ type Record = { readonly [key: string]: unknown }
 
 export const MAX_HEADER_LENGTH = 12
 
+// 选择对话框系统提示词的版本号。问题翻译的缓存键会带上它，提示词变化时
+// 换新键，避免继续复用旧提示词时代持久化的译文。改动问题提示词时必须递增。
+export const QUESTIONS_PROMPT_TAG = 'CLAUDE_CODE_SESSION_QUESTION_TRANSLATION_V1'
+
 function isRecord(value: unknown): value is Record {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
@@ -189,6 +193,11 @@ function buildRequest(
     maxTokens,
   }
 }
+
+// 对话框回复偶尔是截断/未转义的 JSON，或者条数与输入对不上。与回复翻译
+// 相同，格式错误时追加这段纠正说明再试一次，不改变缓存键。
+export const QUESTIONS_JSON_RETRY_PROMPT =
+  'Your previous reply was not a single valid JSON object of the shape {"translations":[...]}. Reply again with only that JSON: the same number of entries in the same order as the input array, escaping every newline as \\n and every double quote as \\".'
 
 export function buildQuestionsRequest(
   texts: readonly string[],
