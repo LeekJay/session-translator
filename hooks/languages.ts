@@ -93,7 +93,8 @@ export function isUsableTranslation(
   const prose = text.replace(PLACEHOLDER_PATTERN, ' ').trim()
   if (prose.length === 0) return false
 
-  if (sourceProseLength > 400 && prose.length < sourceProseLength * 0.3) {
+  const minRatio = language === 'zh' || language === 'ja' ? 0.15 : 0.3
+  if (sourceProseLength > 400 && prose.length < sourceProseLength * minRatio) {
     return false
   }
 

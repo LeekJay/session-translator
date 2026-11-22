@@ -1,5 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 import type { TranslationCache } from '../types'
+import { isUsableTranslation } from './languages'
 import {
   cacheKey,
   finalizeTranslation,
@@ -73,4 +74,13 @@ test('多行译文未转义换行时仍算翻译成功', {}, async () => {
   expect(entry.status === 'translated' ? entry.text : '').toBe(
     '回复第一行\n回复第二行',
   )
+})
+
+test('长英文译为较短中文时不误判为截断，严重截断仍失败', {}, async () => {
+  const sourceLength = 480
+  const normalZh = '这是一段正常的中文翻译内容。'.repeat(9) // 126 chars
+  const truncatedZh = '这是一段被严重截断的中文翻译内容。'.repeat(2).slice(0, 30)
+
+  expect(isUsableTranslation(normalZh, 'zh', sourceLength)).toBe(true)
+  expect(isUsableTranslation(truncatedZh, 'zh', sourceLength)).toBe(false)
 })

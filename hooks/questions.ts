@@ -1,5 +1,6 @@
 import type { TranslationLanguage } from '../types'
 import { languageName } from './languages'
+import { estimateMaxTokens } from './translate'
 
 type Record = { readonly [key: string]: unknown }
 
@@ -180,7 +181,7 @@ function buildRequest(
     .join('\n')
 
   const total = texts.reduce((sum, text) => sum + text.length, 0)
-  const maxTokens = Math.min(16000, Math.max(4096, Math.ceil(total * 1.2)))
+  const maxTokens = estimateMaxTokens(total)
 
   return {
     system,
@@ -562,6 +563,7 @@ export function translateAnswers(
     labels: ReadonlyMap<string, string>,
     mode: AnswerMode,
   ): unknown => {
+    if (typeof value !== 'string') return value
     return splitAnswer(value, labels, mode)
       .map(segment => {
         const text =

@@ -697,3 +697,37 @@ test('两个请求都把附加规则放在 system 末尾', {}, async () => {
     expect(lines[lines.length - 1]).toBe('Use an informal tone.')
   }
 })
+
+test('答案中的非字符串值原样保留', {}, async () => {
+  const translated = rewriteQuestions(QUESTIONS, [
+    '用哪个测试库？',
+    '测试库',
+    '维特',
+    '快。',
+    '杰斯特',
+    '常用。',
+  ]) as unknown[]
+
+  const arrayVal = ['a', 'b']
+  const objectVal = { nested: true }
+  const result = {
+    questions: translated,
+    answers: {
+      '用哪个测试库？': null,
+      arrayKey: arrayVal,
+      objectKey: objectVal,
+    },
+  }
+
+  const back = translateAnswers(
+    result,
+    QUESTIONS,
+    translated,
+  ) as Record<string, unknown>
+
+  expect(back.answers).toEqual({
+    'Which library should we use?': null,
+    arrayKey: arrayVal,
+    objectKey: objectVal,
+  })
+})

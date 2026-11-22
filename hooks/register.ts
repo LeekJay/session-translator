@@ -1,22 +1,11 @@
 import { atom, read, update } from 'claude-code'
+import type { EngineInterface, Register, RenderElement } from 'claude-code'
 import type {
-  EngineInterface,
-  ModelCompleteResult,
-  PluginOptions,
-  Register,
-  RenderElement,
-} from 'claude-code'
-import type {
-  OriginalPrompts,
   TranslationCache,
   TranslationCacheEntry,
   TranslationLanguage,
 } from '../types'
-import {
-  isTranslationLanguage,
-  isUsableTranslation,
-  languageName,
-} from './languages'
+import { isUsableTranslation, languageName } from './languages'
 import {
   buildAnswersRequest,
   buildQuestionsRequest,
@@ -34,15 +23,54 @@ import {
   describeError,
   finalizeTranslation,
   isTransientFailure,
-  isTranslationCache,
   mergeCaches,
-  persistableCache,
   prepareTranslation,
   pruneCache,
   shouldTranslate,
   translationSignature,
 } from './translate'
 import type { TranslateOptions } from './translate'
+import {
+  CACHE_STORE_KEY,
+  LEGACY_ORIGINALS_KEY,
+  PERSIST_DELAY_MS,
+  createStorageState,
+  excessOriginalKeys,
+  mergePersistedCache,
+  parseLegacyOriginals,
+  rememberOriginal,
+  resolvePersistedCache,
+  storedOriginalKey,
+} from './storage'
+import type { StorageState } from './storage'
+import {
+  SETTING_KEYS,
+  SKIP_COMMAND_ARGS_TRANSLATION,
+  TRANSLATOR_TEST_PROMPT,
+  applyStoredSettings,
+  describeCompletion,
+  describeSettings,
+  describeSonnet,
+  formatConfigRows,
+  needsSonnet,
+  parseTranslatorCommand,
+  readOptions,
+  settingsPayload,
+} from './commands'
+import type { Options, RuntimeConfig } from './commands'
+
+export type { Options }
+export {
+  SETTING_KEYS,
+  applyStoredSettings,
+  settingsPayload,
+  describeSettings,
+}
+
+const cache = atom(
+  { plugin: 'session-translator', key: 'cache' } as const,
+  {},
+)
 
 const MAX_INPUT_LENGTH = 20_000
 
@@ -57,25 +85,40 @@ const TRANSLATABLE_ORIGINS: ReadonlySet<string> = new Set([
   'unclassified',
 ])
 
-const cache = atom(
-  { plugin: 'session-translator', key: 'cache' } as const,
-  {},
-)
+const SLASH_COMMAND_PATTERN = /^\s*\/[A-Za-z0-9_:-]+(?:\s|$)/
 
-const pending = new Set<string>()
+export function isSlashCommand(text: string): boolean {
+  return SLASH_COMMAND_PATTERN.test(text)
+}
+
+async function translateInputWithRetry(
+  $: EngineInterface,
+  text: string,
+  config: Options,
+) {
+  const request: TranslateOptions = {
+    text,
+    target: config.inputLanguage,
+    translationRules: config.translationRules,
+    model: config.model,
+    kind: 'input',
+  }
+  let entry = await translate($, request)
+  // 输入翻译失败会把原文交给主模型，违背替换模式；瞬时失败再试一次。
+  if (entry.status !== 'translated' && isTransientFailure(entry.reason)) {
+    entry = await translate($, request)
+  }
+  return entry
+}
+
+const defaultPending = new Set<string>()
 
 type PendingInput = {
   readonly translated: string
   readonly original: string
 }
 
-// prompt.submit 拿不到消息 ID；session.append 才带 uuid。提交时先记下译文与原文，
-// 落库时按文本匹配并绑定到消息 ID，查看时再按消息 ID 找回原文。
-// 排队提交时可能有多条同时等待落库，按先后顺序匹配；上限防止异常情况无限增长。
-const pendingInputs: PendingInput[] = []
 const MAX_PENDING_INPUTS = 16
-let legacyOriginals: OriginalPrompts = {}
-const loadedOriginals = new Map<string, string>()
 
 export type ScheduleResult = 'scheduled' | 'busy' | 'failed'
 
@@ -86,194 +129,18 @@ export function scheduleTranslation(
   schedule: Schedule,
   key: string,
   start: () => void,
+  pendingSet: Set<string> = defaultPending,
 ): ScheduleResult {
-  if (pending.has(key)) return 'busy'
-  pending.add(key)
+  if (pendingSet.has(key)) return 'busy'
+  pendingSet.add(key)
   try {
     schedule(start)
     return 'scheduled'
   } catch {
-    pending.delete(key)
+    pendingSet.delete(key)
     return 'failed'
   }
 }
-
-const CACHE_STORE_KEY = 'cache'
-const PERSIST_DELAY_MS = 1000
-
-let persistScheduled = false
-let persistedCache: TranslationCache | undefined
-
-// 缓存本身在 $.state，只活一个会话；这里把它落到 $.store，--resume 时再装回来。
-async function readPersistedCache(
-  $: EngineInterface,
-): Promise<TranslationCache> {
-  if (persistedCache !== undefined) return persistedCache
-
-  try {
-    const saved = await $.store.get(CACHE_STORE_KEY)
-    // 读成功但为空或格式不对：确实没有可复用缓存，记成空表。
-    // 读 store 发生在每条助手消息的渲染路径上，不记住会每次都再读一遍；
-    // 空表对 mergeCaches 与恢复逻辑等价。读期间持久化可能已写入结果，
-    // 空表不覆盖它。
-    persistedCache = isTranslationCache(saved)
-      ? persistableCache(saved)
-      : (persistedCache ?? {})
-    return persistedCache
-  } catch {
-    // 读失败只是这一次失败，可能还有可复用缓存；不记忆空表，
-    // 下次渲染再试，避免一次临时故障让整个会话都不再跨会话复用。
-    return {}
-  }
-}
-
-function schedulePersist($: EngineInterface): void {
-  if (persistScheduled) return
-  persistScheduled = true
-
-  try {
-    $.clock.after(PERSIST_DELAY_MS, async () => {
-      persistScheduled = false
-      try {
-        const entries = await read($, cache)
-        let latestPersisted = persistedCache
-        try {
-          const saved = await $.store.get(CACHE_STORE_KEY)
-          if (isTranslationCache(saved)) {
-            latestPersisted = persistableCache(saved)
-          }
-        } catch {
-          // 读取失败时回退到内存中的 persistedCache
-        }
-        const merged = persistableCache(
-          pruneCache(mergeCaches(latestPersisted, entries)),
-        )
-        persistedCache = merged
-        await $.store.set(CACHE_STORE_KEY, merged)
-      } catch (error) {
-        const reason = describeError(error)
-        safeLog($, `翻译缓存持久化失败：${reason}`)
-      }
-    })
-  } catch {
-    persistScheduled = false
-  }
-}
-
-// 每条原文单独占一个 key：多个会话共用一个 store 时，各自只写自己那条消息，
-// 不会像整表回写那样互相覆盖丢数据。
-const ORIGINALS_KEY_PREFIX = 'originals:'
-const MAX_ORIGINAL_PROMPTS = 2000
-
-function storedOriginalKey(messageId: string): string {
-  return `${ORIGINALS_KEY_PREFIX}${messageId}`
-}
-
-async function persistOriginal(
-  $: EngineInterface,
-  messageId: string,
-  original: string,
-): Promise<void> {
-  try {
-    await $.store.set(storedOriginalKey(messageId), original)
-  } catch (error) {
-    const reason = describeError(error)
-    safeLog($, `原文映射持久化失败：${reason}`)
-  }
-}
-
-// 会话开始时只读取旧版整表 'originals' 键并修剪超出上限的逐条键；
-// 逐条键改为在 UserMessage 渲染时按需懒加载，避免启动时批量读取阻塞。
-// 旧版本把原文存成一个整表 'originals' 键；升级后仍读它，否则旧会话
-// --resume 后原文全部丢失。新格式的逐条键优先级更高。
-const LEGACY_ORIGINALS_KEY = 'originals'
-
-async function readLegacyOriginals(
-  $: EngineInterface,
-): Promise<OriginalPrompts> {
-  try {
-    const saved = await $.store.get(LEGACY_ORIGINALS_KEY)
-    if (saved === null || typeof saved !== 'object' || Array.isArray(saved)) {
-      return {}
-    }
-    const out: OriginalPrompts = {}
-    for (const [messageId, value] of Object.entries(saved)) {
-      if (typeof value === 'string') out[messageId] = value
-    }
-    return out
-  } catch {
-    // 旧格式读不到只影响旧会话的原文显示，不影响新格式。
-    return {}
-  }
-}
-
-async function pruneStoredOriginals($: EngineInterface): Promise<void> {
-  try {
-    const keys = (await $.store.keys()).filter(key =>
-      key.startsWith(ORIGINALS_KEY_PREFIX),
-    )
-    // keys() 按插入顺序返回，超出的部分是最旧的，从前面开始删。
-    const excess = keys.length - MAX_ORIGINAL_PROMPTS
-    for (const key of keys.slice(0, Math.max(0, excess))) {
-      await $.store.delete(key)
-    }
-  } catch {
-    // store 不可用时只影响 --resume 后的原文显示。
-  }
-}
-
-async function loadOriginalForMessage(
-  $: EngineInterface,
-  messageId: string,
-  legacy: OriginalPrompts,
-): Promise<string | undefined> {
-  const cached = loadedOriginals.get(messageId)
-  if (cached !== undefined) return cached
-
-  let original: string | undefined
-  try {
-    const value = await $.store.get(storedOriginalKey(messageId))
-    if (typeof value === 'string') {
-      original = value
-    }
-  } catch {
-    // store 读失败时尝试回退到旧版整表。
-  }
-
-  if (original === undefined) {
-    original = legacy[messageId]
-  }
-  if (original === undefined) return undefined
-
-  if (loadedOriginals.size >= MAX_ORIGINAL_PROMPTS) {
-    const oldest = loadedOriginals.keys().next().value
-    if (oldest !== undefined) loadedOriginals.delete(oldest)
-  }
-  loadedOriginals.set(messageId, original)
-  return original
-}
-
-export type Options = {
-  readonly translateInput: boolean
-  readonly inputLanguage: TranslationLanguage
-  readonly translateOutput: boolean
-  readonly outputLanguage: TranslationLanguage
-  readonly model: string
-  readonly translationRules: string
-}
-
-const DEFAULTS: Options = {
-  translateInput: true,
-  inputLanguage: 'en',
-  translateOutput: true,
-  outputLanguage: 'zh',
-  model: 'haiku',
-  translationRules: '',
-}
-
-// settingsPayload 和 describeSettings 共用的键清单：直接从 DEFAULTS 派生。
-// 加新设置时 Options 类型和 DEFAULTS 会先让编译器报错，这里无需再改。
-export const SETTING_KEYS = Object.keys(DEFAULTS) as (keyof Options)[]
 
 type PendingTranslation = {
   readonly key: string
@@ -291,121 +158,6 @@ type PendingQuestions = {
   readonly model: string
 }
 
-function booleanOption(
-  options: PluginOptions,
-  key: string,
-  fallback: boolean,
-): boolean {
-  const value = options[key]
-  return typeof value === 'boolean' ? value : fallback
-}
-
-function stringOption(
-  options: PluginOptions,
-  key: string,
-  fallback: string,
-): string {
-  const value = options[key]
-  return typeof value === 'string' ? value : fallback
-}
-
-function languageOption(
-  options: PluginOptions,
-  key: string,
-  fallback: TranslationLanguage,
-): TranslationLanguage {
-  const value = options[key]
-  return isTranslationLanguage(value) ? value : fallback
-}
-
-// 两个入口共用同一份读取/回退逻辑：选项用 DEFAULTS 兜底，存储设置用当前值兜底。
-function normalizeOptions(
-  source: PluginOptions,
-  fallback: Options,
-): Options {
-  const model = stringOption(source, 'model', fallback.model).trim()
-  return {
-    translateInput: booleanOption(
-      source,
-      'translateInput',
-      fallback.translateInput,
-    ),
-    inputLanguage: languageOption(
-      source,
-      'inputLanguage',
-      fallback.inputLanguage,
-    ),
-    translateOutput: booleanOption(
-      source,
-      'translateOutput',
-      fallback.translateOutput,
-    ),
-    outputLanguage: languageOption(
-      source,
-      'outputLanguage',
-      fallback.outputLanguage,
-    ),
-    model: model.length > 0 ? model : fallback.model,
-    translationRules: stringOption(
-      source,
-      'translationRules',
-      fallback.translationRules,
-    ),
-  }
-}
-
-function readOptions(options: PluginOptions): Options {
-  return normalizeOptions(options, DEFAULTS)
-}
-
-export function applyStoredSettings(
-  current: Options,
-  saved: unknown,
-): Options {
-  if (saved === null || typeof saved !== 'object' || Array.isArray(saved)) {
-    return current
-  }
-
-  return normalizeOptions(saved as PluginOptions, current)
-}
-
-export function settingsPayload(config: Options): Record<string, unknown> {
-  return Object.fromEntries(
-    SETTING_KEYS.map(key => [key, config[key]] as const),
-  )
-}
-
-export function describeSettings(config: Options): string[] {
-  return SETTING_KEYS.map(key =>
-    key === 'translationRules'
-      ? `translationRules=${
-          config.translationRules.trim().length > 0
-            ? config.translationRules
-            : '(empty)'
-        }`
-      : `${key}=${config[key]}`,
-  )
-}
-
-async function configRowsText($: EngineInterface): Promise<string> {
-  try {
-    const rows = (await $.config.list()).filter(row =>
-      row.key.startsWith('session-translator.'),
-    )
-    return rows.length === 0
-      ? 'config rows: none'
-      : `config rows:\n${rows
-          .map(row => `${row.key}=${JSON.stringify(row.value)}`)
-          .join('\n')}`
-  } catch (error) {
-    const reason = describeError(error)
-    return `config rows: unavailable (${reason})`
-  }
-}
-
-const USAGE_LINE =
-  'usage: /translator [status|on|off|input <en|zh|ja|fr|de>|output <en|zh|ja|fr|de>|model <name>|rules <text>|reset]'
-
 function safeLog($: EngineInterface, message: string): void {
   try {
     $.ui.log(message)
@@ -422,53 +174,19 @@ function safeStatus($: EngineInterface, text: string | undefined): void {
   }
 }
 
-const HAN = /\p{Script=Han}/u
-
-function usageLine(result: ModelCompleteResult): string {
-  return `usage: out=${result.usage.output_tokens}, in=${result.usage.input_tokens}`
-}
-
-function describeCompletion(
-  model: string,
-  result: ModelCompleteResult,
-): string {
-  if (result.isAnswered) {
-    return [
-      `model: ${model}`,
-      `reply: ${result.text}`,
-      usageLine(result),
-    ].join('\n')
-  }
-  return [`model: ${model}`, `reason: ${result.reason}`, usageLine(result)].join(
-    '\n',
-  )
-}
-
-function describeSonnet(result: ModelCompleteResult): string {
-  return result.isAnswered
-    ? `sonnet: ${result.text}\nsonnet ${usageLine(result)}`
-    : `sonnet reason: ${result.reason}\nsonnet ${usageLine(result)}`
-}
-
-function needsSonnet(result: ModelCompleteResult): boolean {
-  return !result.isAnswered || !HAN.test(result.text)
-}
-
 async function translate(
   $: EngineInterface,
   item: TranslateOptions,
 ): Promise<TranslationCacheEntry> {
   try {
     const prepared = prepareTranslation(item)
-    const result = await $.model.complete(
-      {
-        model: item.model,
-        prompt: prepared.prompt,
-        system: prepared.system,
-        maxTokens: prepared.maxTokens,
-        effort: 'low',
-      },
-    )
+    const result = await $.model.complete({
+      model: item.model,
+      prompt: prepared.prompt,
+      system: prepared.system,
+      maxTokens: prepared.maxTokens,
+      effort: 'low',
+    })
     if (!result.isAnswered) {
       return {
         status: 'failed',
@@ -599,8 +317,104 @@ async function translateFreeTextAnswers(
   return map
 }
 
+async function readPersistedCache(
+  $: EngineInterface,
+  storage: StorageState,
+): Promise<TranslationCache> {
+  if (storage.persistedCache !== undefined) return storage.persistedCache
+
+  try {
+    const saved = await $.store.get(CACHE_STORE_KEY)
+    return resolvePersistedCache(storage, saved)
+  } catch {
+    // 读失败只是这一次失败，可能还有可复用缓存；不记忆空表，
+    // 下次渲染再试，避免一次临时故障让整个会话都不再跨会话复用。
+    return {}
+  }
+}
+
+function schedulePersist($: EngineInterface, storage: StorageState): void {
+  if (storage.persistScheduled) return
+  storage.persistScheduled = true
+
+  try {
+    $.clock.after(PERSIST_DELAY_MS, async () => {
+      storage.persistScheduled = false
+      try {
+        const entries = await read($, cache)
+        let saved: unknown
+        try {
+          saved = await $.store.get(CACHE_STORE_KEY)
+        } catch {
+          // 读取失败时回退到内存中的 persistedCache
+        }
+        const merged = mergePersistedCache(storage, saved, entries)
+        await $.store.set(CACHE_STORE_KEY, merged)
+      } catch (error) {
+        const reason = describeError(error)
+        safeLog($, `翻译缓存持久化失败：${reason}`)
+      }
+    })
+  } catch {
+    storage.persistScheduled = false
+  }
+}
+
+async function loadOriginalForMessage(
+  $: EngineInterface,
+  storage: StorageState,
+  messageId: string,
+): Promise<string | undefined> {
+  const cached = storage.loadedOriginals.get(messageId)
+  if (cached !== undefined) return cached
+
+  let original: string | undefined
+  try {
+    const value = await $.store.get(storedOriginalKey(messageId))
+    if (typeof value === 'string') {
+      original = value
+    }
+  } catch {
+    // store 读失败时尝试回退到旧版整表。
+  }
+
+  if (original === undefined) {
+    original = storage.legacyOriginals[messageId]
+  }
+  if (original === undefined) return undefined
+
+  rememberOriginal(storage, messageId, original)
+  return original
+}
+
+async function saveOriginalForMessage(
+  $: EngineInterface,
+  storage: StorageState,
+  messageId: string,
+  original: string,
+): Promise<void> {
+  rememberOriginal(storage, messageId, original)
+  try {
+    await $.store.set(storedOriginalKey(messageId), original)
+  } catch (error) {
+    const reason = describeError(error)
+    safeLog($, `原文映射持久化失败：${reason}`)
+  }
+}
+
+async function configRowsText($: EngineInterface): Promise<string> {
+  try {
+    return formatConfigRows(await $.config.list())
+  } catch (error) {
+    const reason = describeError(error)
+    return `config rows: unavailable (${reason})`
+  }
+}
+
 async function commit(
   $: EngineInterface,
+  storage: StorageState,
+  pending: Set<string>,
   key: string,
   label: string,
   produce: () => Promise<TranslationCacheEntry>,
@@ -617,7 +431,7 @@ async function commit(
     }
 
     await update($, cache, current => pruneCache({ ...current, [key]: entry }))
-    schedulePersist($)
+    schedulePersist($, storage)
   } catch (error) {
     const reason = describeError(error)
     safeLog($, `${label}翻译未写入缓存：${reason}`)
@@ -626,8 +440,13 @@ async function commit(
   }
 }
 
-function run($: EngineInterface, item: PendingTranslation): Promise<void> {
-  return commit($, item.key, '回复', () =>
+function run(
+  $: EngineInterface,
+  storage: StorageState,
+  pending: Set<string>,
+  item: PendingTranslation,
+): Promise<void> {
+  return commit($, storage, pending, item.key, '回复', () =>
     translate($, {
       text: item.text,
       target: item.target,
@@ -651,11 +470,18 @@ function signatureOf(config: Options): string {
 export const register: Register = (on, options) => {
   // reset 回到注册时读到的插件选项，而不是硬编码默认值。
   const initialOptions = readOptions(options)
-  const runtime = {
+  const runtime: RuntimeConfig = {
     config: { ...initialOptions },
     signature: '',
   }
   runtime.signature = signatureOf(runtime.config)
+
+  const pending = new Set<string>()
+  // prompt.submit 拿不到消息 ID；session.append 才带 uuid。提交时先记下译文与原文，
+  // 落库时按文本匹配并绑定到消息 ID，查看时再按消息 ID 找回原文。
+  // 排队提交时可能有多条同时等待落库，按先后顺序匹配；上限防止异常情况无限增长。
+  const pendingInputs: PendingInput[] = []
+  const storage: StorageState = createStorageState()
 
   on('session.start', async ($, e, next) => {
     try {
@@ -667,8 +493,9 @@ export const register: Register = (on, options) => {
       // 读取失败时沿用当前设置。
     }
 
+    storage.persistedCache = undefined
     try {
-      const savedCache = await readPersistedCache($)
+      const savedCache = await readPersistedCache($, storage)
       if (Object.keys(savedCache).length > 0) {
         await update($, cache, current =>
           pruneCache(mergeCaches(savedCache, current)),
@@ -678,9 +505,22 @@ export const register: Register = (on, options) => {
       // 读取失败时从空缓存开始，回复照常翻译。
     }
 
-    loadedOriginals.clear()
-    legacyOriginals = await readLegacyOriginals($)
-    await pruneStoredOriginals($)
+    storage.loadedOriginals.clear()
+    try {
+      storage.legacyOriginals = parseLegacyOriginals(
+        await $.store.get(LEGACY_ORIGINALS_KEY),
+      )
+    } catch {
+      storage.legacyOriginals = {}
+    }
+    try {
+      const keys = excessOriginalKeys(await $.store.keys())
+      for (const key of keys) {
+        await $.store.delete(key)
+      }
+    } catch {
+      // store 不可用时只影响 --resume 后的原文显示。
+    }
 
     try {
       await $.command.register({
@@ -702,9 +542,11 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: 'translator-test' }, async $ => {
     try {
-      const prompt =
-        'Translate "Hello world" into Simplified Chinese. Return only {"translation":"..."}.'
-      const request = { prompt, maxTokens: 4096, effort: 'low' as const }
+      const request = {
+        prompt: TRANSLATOR_TEST_PROMPT,
+        maxTokens: 4096,
+        effort: 'low' as const,
+      }
       const lines: string[] = [...describeSettings(runtime.config)]
 
       lines.push(await configRowsText($))
@@ -730,93 +572,38 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: 'translator' }, async ($, e) => {
     try {
-      const apply = async (
-        next: Options,
-        reply: string,
-      ): Promise<{ text: string }> => {
-        runtime.config = next
-        runtime.signature = signatureOf(next)
+      const action = parseTranslatorCommand(
+        e.args,
+        runtime.config,
+        initialOptions,
+      )
 
-        try {
-          await $.store.set('settings', settingsPayload(next))
-          return { text: reply }
-        } catch {
-          return { text: `${reply}\n（本次生效，未能持久化）` }
-        }
-      }
-
-      const trimmed = e.args.trim()
-      const match = /^(\S+)(?:\s+([\s\S]*))?$/.exec(trimmed)
-      const verb = (match?.[1] ?? 'status').toLowerCase()
-      const rest = match?.[2] ?? ''
-      const current = runtime.config
-
-      if (verb === 'status') {
+      if (action.kind === 'status') {
         return {
-          text: [...describeSettings(current), await configRowsText($)].join(
-            '\n',
-          ),
+          text: [
+            ...describeSettings(runtime.config),
+            await configRowsText($),
+          ].join('\n'),
         }
       }
 
-      if (verb === 'on' || verb === 'off') {
-        const enabled = verb === 'on'
-        return apply(
-          {
-            ...current,
-            translateInput: enabled,
-            translateOutput: enabled,
-          },
-          `已更新：translateInput=${enabled}, translateOutput=${enabled}`,
-        )
+      if (action.kind === 'reply') {
+        return { text: action.text }
       }
 
-      if (verb === 'input' || verb === 'output') {
-        const language = rest.trim()
-        if (!isTranslationLanguage(language)) return { text: USAGE_LINE }
+      runtime.config = action.next
+      runtime.signature = signatureOf(action.next)
 
-        return apply(
-          verb === 'input'
-            ? { ...current, inputLanguage: language }
-            : { ...current, outputLanguage: language },
-          `已更新：${verb}Language=${language}`,
-        )
-      }
-
-      if (verb === 'model') {
-        const model = rest.trim()
-        if (model.length === 0) return { text: USAGE_LINE }
-        return apply({ ...current, model }, `已更新：model=${model}`)
-      }
-
-      if (verb === 'rules') {
-        const translationRules = rest.trim()
-        return apply(
-          { ...current, translationRules },
-          translationRules.length === 0
-            ? '已清空：translationRules'
-            : `已更新：translationRules=${translationRules}`,
-        )
-      }
-
-      if (verb === 'reset') {
-        const next: Options = { ...initialOptions }
-        runtime.config = next
-        runtime.signature = signatureOf(next)
-
-        try {
+      try {
+        if (action.kind === 'reset') {
           await $.store.delete('settings')
-          return {
-            text: `已重置：${describeSettings(next).join('，')}`,
-          }
-        } catch {
-          return {
-            text: `已重置：${describeSettings(next).join('，')}\n（本次生效，未能持久化）`,
-          }
+        } else {
+          await $.store.set('settings', settingsPayload(action.next))
         }
+        return { text: action.reply }
+      } catch {
+        return { text: `${action.reply}\n（本次生效，未能持久化）` }
       }
-
-      return { text: USAGE_LINE }
     } catch (error) {
       const reason = describeError(error)
       return { text: `translator failed: ${reason}` }
@@ -834,11 +621,49 @@ export const register: Register = (on, options) => {
     })
   }).catch(($, e, next) => next(e))
 
+  // 斜杠命令在 prompt.submit 阶段改写不会生效；改在这里翻译其参数。
+  on('command.run', async ($, e, next) => {
+    if (!runtime.config.translateInput) return next(e)
+    if (SKIP_COMMAND_ARGS_TRANSLATION.has(e.command)) return next(e)
+    if (e.args.trim().length === 0) return next(e)
+    if (
+      !shouldTranslate(
+        e.args,
+        runtime.config.inputLanguage,
+        runtime.config.translationRules,
+      )
+    ) {
+      return next(e)
+    }
+    if (e.args.length > MAX_INPUT_LENGTH) {
+      return {
+        text: '命令参数过长（超过 20000 字符），未能翻译。请缩短后重试。',
+      }
+    }
+
+    safeStatus($, '翻译中…')
+    try {
+      const entry = await translateInputWithRetry($, e.args, runtime.config)
+      if (entry.status !== 'translated') {
+        safeLog($, `命令参数翻译失败，已取消执行：${entry.reason}`)
+        return { text: `命令参数翻译失败，已取消执行：${entry.reason}` }
+      }
+      return next({ ...e, args: entry.text })
+    } finally {
+      safeStatus($, undefined)
+    }
+  }).catch(($, e, next) => {
+    safeLog($, '命令参数翻译异常，已取消执行')
+    return { text: '命令参数翻译异常，已取消执行' }
+  })
+
   on('prompt.submit', async ($, e, next) => {
     if (!runtime.config.translateInput) return next(e)
 
     const originKind = e.origin?.kind ?? 'unclassified'
     if (!TRANSLATABLE_ORIGINS.has(originKind)) return next(e)
+    // 宿主会忽略 prompt.submit 对斜杠命令的改写并发出警告，命令参数改由 command.run 处理。
+    if (isSlashCommand(e.text)) return next(e)
     if (
       !shouldTranslate(
         e.text,
@@ -855,18 +680,7 @@ export const register: Register = (on, options) => {
 
     safeStatus($, '翻译中…')
     try {
-      const request: TranslateOptions = {
-        text: e.text,
-        target: runtime.config.inputLanguage,
-        translationRules: runtime.config.translationRules,
-        model: runtime.config.model,
-        kind: 'input',
-      }
-      let entry = await translate($, request)
-      // 输入翻译失败会把原文交给主模型，违背替换模式；瞬时失败再试一次。
-      if (entry.status !== 'translated' && isTransientFailure(entry.reason)) {
-        entry = await translate($, request)
-      }
+      const entry = await translateInputWithRetry($, e.text, runtime.config)
 
       if (entry.status !== 'translated') {
         // 回退原文会把它交给主模型，违背替换模式；丢弃提交，引擎会把原文放回输入框。
@@ -910,7 +724,8 @@ export const register: Register = (on, options) => {
           }
           const entries = await read($, cache)
           const entry =
-            entries[item.key] ?? (await readPersistedCache($))[item.key]
+            entries[item.key] ??
+            (await readPersistedCache($, storage))[item.key]
 
           if (entry?.status === 'translated') {
             rewritten = fitTables(entry.text, e.viewport?.columns)
@@ -918,7 +733,8 @@ export const register: Register = (on, options) => {
             const outcome = scheduleTranslation(
               callback => $.clock.after(1, callback),
               item.key,
-              () => run($, item),
+              () => run($, storage, pending, item),
+              pending,
             )
             if (outcome === 'failed') return next(e)
 
@@ -949,7 +765,7 @@ export const register: Register = (on, options) => {
       const messageId = e.requestId
       if (typeof messageId !== 'string') return next(e)
 
-      const original = await loadOriginalForMessage($, messageId, legacyOriginals)
+      const original = await loadOriginalForMessage($, storage, messageId)
       if (original === undefined) return next(e)
 
       return next({ ...e, props: { ...e.props, text: original } })
@@ -984,7 +800,8 @@ export const register: Register = (on, options) => {
             `tool-questions\u0000${JSON.stringify(texts)}`,
           )
           const entries = await read($, cache)
-          let entry = entries[key] ?? (await readPersistedCache($))[key]
+          let entry =
+            entries[key] ?? (await readPersistedCache($, storage))[key]
 
           if (entry === undefined && !pending.has(key)) {
             pending.add(key)
@@ -1003,7 +820,7 @@ export const register: Register = (on, options) => {
 
             try {
               $.clock.after(1, () =>
-                commit($, key, '选择项', async () => entry!),
+                commit($, storage, pending, key, '选择项', async () => entry!),
               )
             } catch {
               pending.delete(key)
@@ -1163,12 +980,7 @@ export const register: Register = (on, options) => {
       const item = pendingInputs.splice(index, 1)[0]
       if (item === undefined) return next(e)
 
-      if (loadedOriginals.size >= MAX_ORIGINAL_PROMPTS) {
-        const oldest = loadedOriginals.keys().next().value
-        if (oldest !== undefined) loadedOriginals.delete(oldest)
-      }
-      loadedOriginals.set(messageId, item.original)
-      await persistOriginal($, messageId, item.original)
+      await saveOriginalForMessage($, storage, messageId, item.original)
     } catch {
       // 映射失败只影响查看；记录和翻译本身不受影响。
     }

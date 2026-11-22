@@ -1712,6 +1712,43 @@ test(
 )
 
 test(
+  'session.start 再次触发时会重新读取 store 里的新缓存，不复用旧内存缓存',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    const source = 'Reply persisted by another session.'
+    const signature = translationSignature({
+      inputLanguage: 'en',
+      outputLanguage: 'zh',
+      model: 'haiku',
+      translationRules: '',
+      promptVersion: PROMPT_TAG,
+    })
+    const key = cacheKey(signature, 'zh', 'output', source)
+
+    let storedCache: Record<string, unknown> = {}
+    on('store.get', { key: 'cache' }, () => ({ value: storedCache }))
+    on('session.start', ($inner, e) => e)
+    registerRenderBottoms(on)
+    const calls = installModel(on, () => 'should not be used')
+
+    // 首次启动时 store 为空，内存里的 persistedCache 会记下空表。
+    await $.session.start({ cwd: '.' })
+
+    // 另一并发会话随后写入了新缓存条目。
+    storedCache = {
+      [key]: { status: 'translated', text: '其他会话新写入的译文。' },
+    }
+
+    // 再次触发 session.start 时应重置内存缓存并重新读取 store。
+    await $.session.start({ cwd: '.' })
+
+    const tree = await $.ui.render(assistantInput(source))
+    expect(drawnText(tree)).toBe('其他会话新写入的译文。')
+    expect(calls()).toBe(0)
+  },
+)
+
+test(
   '占位符缺失时保留原文并缓存失败',
   { options: { translateOutput: true, outputLanguage: 'zh' } },
   async ($, on) => {
@@ -1904,6 +1941,125 @@ test(
 
     expect(args).toContain('解释一下这个函数')
     expect(args).toContain('Answer in Simplified Chinese')
+  },
+)
+
+test(
+  'prompt.submit 放行斜杠命令不翻译，避免触发宿主警告',
+  { options: { translateInput: true, inputLanguage: 'en' } },
+  async ($, on) => {
+    const calls = installModel(on, () => 'should not translate')
+    let submitted = ''
+    on('prompt.submit', ($, e) => {
+      submitted = e.text
+      return { text: e.text }
+    })
+
+    const line =
+      '/pstack:poteto-mode 优化千牛登录流程的整体速度，现在用户点击登录后在工作台 -> 接待中心 的流程动作延迟很大'
+    await $.prompt.submit({
+      text: line,
+      origin: { kind: 'composer' },
+    })
+
+    expect(calls()).toBe(0)
+    expect(submitted).toBe(line)
+  },
+)
+
+test(
+  'prompt.submit 不误放行以斜杠开头的路径输入',
+  { options: { translateInput: true, inputLanguage: 'en' } },
+  async ($, on) => {
+    const calls = installModel(on, source =>
+      translated(`How to clean ${source.split(' ')[0]}`),
+    )
+    let submitted = ''
+    on('prompt.submit', ($, e) => {
+      submitted = e.text
+      return { text: e.text }
+    })
+
+    await $.prompt.submit({
+      text: '/tmp/中文目录 怎么清理',
+      origin: { kind: 'composer' },
+    })
+
+    expect(calls()).toBe(1)
+    expect(submitted).toBe('How to clean /tmp/中文目录')
+  },
+)
+
+test(
+  'command.run 翻译斜杠命令参数并透传原命令名',
+  { options: { translateInput: true, inputLanguage: 'en' } },
+  async ($, on) => {
+    const calls = installModel(on, () =>
+      translated('Optimize the overall speed of the Qianniu login flow'),
+    )
+    let receivedCommand = ''
+    let receivedArgs = ''
+    on('command.run', { command: 'pstack:poteto-mode' }, ($, e) => {
+      receivedCommand = e.command
+      receivedArgs = e.args
+      return { text: '' }
+    })
+
+    await $.command.run({
+      command: 'pstack:poteto-mode',
+      args: '优化千牛登录流程的整体速度',
+    })
+
+    expect(calls()).toBe(1)
+    expect(receivedCommand).toBe('pstack:poteto-mode')
+    expect(receivedArgs).toBe(
+      'Optimize the overall speed of the Qianniu login flow',
+    )
+  },
+)
+
+test(
+  'command.run 跳过内置命令，不翻译其参数',
+  { options: { translateInput: true, inputLanguage: 'en' } },
+  async ($, on) => {
+    const calls = installModel(on, () => translated('should not translate'))
+    let receivedArgs = ''
+    on('command.run', { command: 'rename' }, ($, e) => {
+      receivedArgs = e.args
+      return { text: '' }
+    })
+
+    await $.command.run({ command: 'rename', args: '登录优化会话' })
+
+    expect(calls()).toBe(0)
+    expect(receivedArgs).toBe('登录优化会话')
+  },
+)
+
+test(
+  'command.run 翻译失败时取消执行并返回提示',
+  { options: { translateInput: true, inputLanguage: 'en' } },
+  async ($, on) => {
+    on('model.complete', () => ({
+      value: {
+        isAnswered: false as const,
+        reason: 'network error',
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    }))
+    let ran = false
+    on('command.run', { command: 'pstack:poteto-mode' }, () => {
+      ran = true
+      return { text: '' }
+    })
+
+    const reply = await $.command.run({
+      command: 'pstack:poteto-mode',
+      args: '优化千牛登录流程',
+    })
+
+    expect(ran).toBe(false)
+    expect(reply.text).toContain('命令参数翻译失败')
   },
 )
 

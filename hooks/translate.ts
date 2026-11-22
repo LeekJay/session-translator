@@ -199,6 +199,10 @@ export function describeError(error: unknown): string {
   return error instanceof Error ? error.message : 'unknown-error'
 }
 
+export function estimateMaxTokens(length: number): number {
+  return Math.min(16000, Math.max(4096, Math.ceil(length * 1.2)))
+}
+
 export function prepareTranslation(
   options: TranslateOptions,
 ): PreparedTranslation {
@@ -213,10 +217,7 @@ export function prepareTranslation(
   return {
     system: request.system,
     prompt: request.prompt,
-    maxTokens: Math.min(
-      16000,
-      Math.max(4096, Math.ceil(options.text.length * 1.2)),
-    ),
+    maxTokens: estimateMaxTokens(options.text.length),
     // 只比较可翻译正文的长度；受保护片段在译文里只剩占位符，不能算进原文长度。
     sourceProseLength: protectedText.text
       .replace(PLACEHOLDER_PATTERN, ' ')
