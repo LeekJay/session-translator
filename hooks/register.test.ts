@@ -50,6 +50,14 @@ function translated(source: string): string {
   return JSON.stringify({ translation: source })
 }
 
+const CHINESE_UNIT = '请帮我看看这个文件'
+const ENGLISH_UNIT = 'Please review the login flow carefully. '
+
+// 拼出指定长度的单行提示，用来卡 MAX_INPUT_LENGTH 的边界。
+function repeated(unit: string, length: number): string {
+  return unit.repeat(Math.ceil(length / unit.length)).slice(0, length)
+}
+
 function registerRenderBottoms(on: On): void {
   on('ui.render', { component: 'AssistantMessage' }, ($, e) => {
     const { Text } = $.ui.resolve(e)
@@ -260,12 +268,171 @@ test(
   { options: { translateInput: true, inputLanguage: 'en' } },
   async ($, on) => {
     registerRenderBottoms(on)
-    mock.store(on, { originals: { 'm-old': '旧的原文' } })
+    mock.store(on, { 'originals:m-old': '旧的原文' })
+    on('session.start', ($inner, e) => e)
+    await $.session.start({ cwd: '.' })
 
     const drawn = await $.ui.render(
       userMessageInput('OK', { kind: 'composer' }, 'm-old'),
     )
     expect(drawnText(drawn)).toBe('旧的原文')
+  },
+)
+
+test(
+  '各自独立写原文，新会话重载后三条都还在',
+  {
+    options: { translateInput: true, inputLanguage: 'en' },
+    plugins: [
+      {
+        name: 'originals-probe',
+        // 直接看 store 里的键值，绕开会话里的内存映射，
+        // 确保是逐条写入而不是只在当前会话里能显示。
+        register(on) {
+          on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
+            const expected: Record<string, string> = {
+              'originals:m-old': '旧的原文',
+              'originals:m-new-1': '第一条新原文',
+              'originals:m-new-2': '第二条新原文',
+            }
+            for (const [key, value] of Object.entries(expected)) {
+              if ((await $.store.get(key)) !== value) {
+                throw new Error(
+                  `store 里 ${key} 的值不对：${JSON.stringify(await $.store.get(key))}`,
+                )
+              }
+            }
+            return next(e)
+          })
+        },
+      },
+    ],
+  },
+  async ($, on) => {
+    registerRenderBottoms(on)
+    mock.store(on, { 'originals:m-old': '旧的原文' })
+    installModel(on, () => translated('OK'))
+    on('prompt.submit', ($inner, e) => ({ text: e.text }))
+    on('session.start', ($inner, e) => e)
+
+    // 两个写入方各写自己那条消息：各自只落自己的 key，不整表回写。
+    await $.prompt.submit({
+      text: '第一条新原文',
+      wait: false,
+      origin: { kind: 'composer' },
+    })
+    await $.session.append(appendedUserMessage('OK', 'm-new-1') as never)
+    await $.prompt.submit({
+      text: '第二条新原文',
+      wait: false,
+      origin: { kind: 'composer' },
+    })
+    await $.session.append(appendedUserMessage('OK', 'm-new-2') as never)
+
+    // 新会话从 store 逐条装回。
+    await $.session.start({ cwd: '.' })
+
+    const seeded = await $.ui.render(
+      userMessageInput('OK', { kind: 'composer' }, 'm-old'),
+    )
+    const first = await $.ui.render(
+      userMessageInput('OK', { kind: 'composer' }, 'm-new-1'),
+    )
+    const second = await $.ui.render(
+      userMessageInput('OK', { kind: 'composer' }, 'm-new-2'),
+    )
+    expect(drawnText(seeded)).toBe('旧的原文')
+    expect(drawnText(first)).toBe('第一条新原文')
+    expect(drawnText(second)).toBe('第二条新原文')
+  },
+)
+
+test(
+  '新会话启动时按上限修剪 store 里最旧的原文',
+  {
+    options: { translateInput: true, inputLanguage: 'en' },
+    plugins: [
+      {
+        name: 'prune-probe',
+        // 渲染时读 store，确认删除真的落到了存储里，不只是没装进内存映射。
+        register(on) {
+          on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
+            const keys = await $.store.keys()
+            if (keys.includes('originals:m-0')) {
+              throw new Error('store 里最旧的原文没有被修剪')
+            }
+            if (keys.length !== 2000) {
+              throw new Error(`store 里还剩 ${keys.length} 条`)
+            }
+            return next(e)
+          })
+        },
+      },
+    ],
+  },
+  async ($, on) => {
+    registerRenderBottoms(on)
+    on('session.start', ($inner, e) => e)
+
+    // 上限 2000：多存一条最旧的，启动后最旧的一条应被修剪掉。
+    const entries: Record<string, string> = {}
+    for (let index = 0; index < 2001; index += 1) {
+      entries[`originals:m-${index}`] = `原文 ${index}`
+    }
+    mock.store(on, entries)
+
+    await $.session.start({ cwd: '.' })
+
+    const pruned = await $.ui.render(
+      userMessageInput('OK', { kind: 'composer' }, 'm-0'),
+    )
+    // 被修剪掉的最旧一条不再解析出原文，回退显示会话里的译文。
+    expect(drawnText(pruned)).toBe('OK')
+
+    const edge = await $.ui.render(
+      userMessageInput('OK', { kind: 'composer' }, 'm-1'),
+    )
+    const newest = await $.ui.render(
+      userMessageInput('OK', { kind: 'composer' }, 'm-2000'),
+    )
+    expect(drawnText(edge)).toBe('原文 1')
+    expect(drawnText(newest)).toBe('原文 2000')
+  },
+)
+
+test(
+  '旧版整表 originals 里的原文升级后仍能显示',
+  { options: { translateInput: true, inputLanguage: 'en' } },
+  async ($, on) => {
+    registerRenderBottoms(on)
+    // 旧版本把原文存成一个整表键；升级后必须仍能读出，否则旧会话 --resume 丢原文。
+    mock.store(on, { originals: { 'm-legacy': '旧格式原文' } })
+    on('session.start', ($inner, e) => e)
+    await $.session.start({ cwd: '.' })
+
+    const drawn = await $.ui.render(
+      userMessageInput('OK', { kind: 'composer' }, 'm-legacy'),
+    )
+    expect(drawnText(drawn)).toBe('旧格式原文')
+  },
+)
+
+test(
+  '同一消息 ID 新格式逐条键优先于旧版整表',
+  { options: { translateInput: true, inputLanguage: 'en' } },
+  async ($, on) => {
+    registerRenderBottoms(on)
+    mock.store(on, {
+      originals: { 'm-both': '旧格式原文' },
+      'originals:m-both': '新格式原文',
+    })
+    on('session.start', ($inner, e) => e)
+    await $.session.start({ cwd: '.' })
+
+    const drawn = await $.ui.render(
+      userMessageInput('OK', { kind: 'composer' }, 'm-both'),
+    )
+    expect(drawnText(drawn)).toBe('新格式原文')
   },
 )
 
@@ -468,6 +635,87 @@ test(
 )
 
 test(
+  '恰好 20000 字符的可翻译提示照常翻译',
+  { options: { translateInput: true, inputLanguage: 'en' } },
+  async ($, on) => {
+    const source = repeated(CHINESE_UNIT, 20_000)
+    const target = repeated(ENGLISH_UNIT, 20_000)
+
+    let reached = ''
+    const calls = installModel(on, () => translated(target))
+    on('prompt.submit', ($, e) => {
+      reached = e.text
+      return { text: e.text }
+    })
+
+    const answer = (await $.prompt.submit({
+      text: source,
+      wait: false,
+      origin: { kind: 'composer' },
+    })) as { drop?: string; text?: string }
+
+    expect(calls()).toBe(1)
+    expect(answer.drop).toBeUndefined()
+    expect(answer.text).toBe(target)
+    expect(reached).toBe(target)
+  },
+)
+
+test(
+  '超过 20000 字符的可翻译提示被丢弃，不把原文交给模型',
+  { options: { translateInput: true, inputLanguage: 'en' } },
+  async ($, on) => {
+    const source = repeated(CHINESE_UNIT, 20_001)
+
+    let reached = ''
+    const calls = installModel(
+      on,
+      () => translated(repeated(ENGLISH_UNIT, 20_001)),
+    )
+    on('prompt.submit', ($, e) => {
+      reached = e.text
+      return { text: e.text }
+    })
+
+    const answer = (await $.prompt.submit({
+      text: source,
+      wait: false,
+      origin: { kind: 'composer' },
+    })) as { drop?: string; text?: string }
+
+    expect(calls()).toBe(0)
+    expect(reached).toBe('')
+    expect(answer.text).toBeUndefined()
+    expect(answer.drop).toContain('过长')
+  },
+)
+
+test(
+  '超过 20000 字符但无需翻译的提示原样通过',
+  { options: { translateInput: true, inputLanguage: 'en' } },
+  async ($, on) => {
+    const source = repeated(ENGLISH_UNIT, 20_001)
+
+    let reached = ''
+    const calls = installModel(on, () => 'should not be used')
+    on('prompt.submit', ($, e) => {
+      reached = e.text
+      return { text: e.text }
+    })
+
+    const answer = (await $.prompt.submit({
+      text: source,
+      wait: false,
+      origin: { kind: 'composer' },
+    })) as { drop?: string; text?: string }
+
+    expect(calls()).toBe(0)
+    expect(answer.drop).toBeUndefined()
+    expect(reached).toBe(source)
+  },
+)
+
+test(
   '表格消息先画占位符，译文到达后显示译文',
   { options: { translateOutput: true, outputLanguage: 'zh' } },
   async ($, on) => {
@@ -645,6 +893,67 @@ test(
 
     expect(calls()).toBe(1)
     expect(asked).toEqual(questions)
+
+    await clock.advance(1)
+    await clock.settle()
+
+    await $.tool.call({ tool: 'AskUserQuestion', questions })
+    expect(calls()).toBe(1)
+    expect(asked).toEqual(questions)
+  },
+)
+
+test(
+  '选择对话框的长问题被模型截断成短句时画原文',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    const clock = mock.clock(on)
+    let asked: Array<Record<string, unknown>> = []
+
+    on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
+      asked = e.questions as Array<Record<string, unknown>>
+      const first = asked[0]!
+      const key = String(first.question)
+      const options = first.options as Array<Record<string, unknown>>
+      return {
+        result: { questions: e.questions, answers: { [key]: options[0]!.label } },
+      }
+    })
+
+    // 语言对、条数也对，只有长度短得离谱，只能靠截断检查拦下。
+    const calls = installModel(
+      on,
+      () =>
+        '{"translations":["用哪个？","API","REST","用 REST 完成集成。","GraphQL","用 GraphQL 完成集成。"]}',
+    )
+
+    const longQuestion =
+      'Which API should the client use for this integration when the existing service must keep working across every supported deployment, and which one keeps the migration path simple for the team? '.repeat(
+        3,
+      )
+
+    const questions = [
+      {
+        question: longQuestion,
+        header: 'API',
+        multiSelect: false,
+        options: [
+          { label: 'REST', description: 'Use the REST API for the integration.' },
+          {
+            label: 'GraphQL',
+            description: 'Use the GraphQL API for the integration.',
+          },
+        ],
+      },
+    ]
+
+    expect(longQuestion.length).toBeGreaterThan(400)
+
+    await $.tool.call({ tool: 'AskUserQuestion', questions })
+
+    expect(calls()).toBe(1)
+    expect(asked).toEqual(questions)
+    expect(asked[0]?.question).toBe(longQuestion)
 
     await clock.advance(1)
     await clock.settle()
@@ -1217,6 +1526,64 @@ test(
     await clock.advance(1)
     await clock.settle()
     expect(calls()).toBe(1)
+  },
+)
+
+test(
+  'store 里没有缓存时只读一次，后续渲染不再重复读',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    // 读 store 发生在每条助手消息的渲染路径上；空缓存也必须记住，
+    // 否则每条消息都会再打一次跨会话的 store。
+    const clock = mock.clock(on)
+    let cacheReads = 0
+    on(
+      'store.get',
+      { key: 'cache' },
+      ($inner, e, next) => {
+        cacheReads += 1
+        return next(e)
+      },
+    )
+    mock.store(on)
+    registerRenderBottoms(on)
+    installModel(on, () => translated('这是助手的回复。'))
+
+    await $.ui.render(assistantInput('First reply from the assistant.'))
+    await $.ui.render(assistantInput('Second reply from the assistant.'))
+
+    expect(cacheReads).toBe(1)
+    await clock.settle()
+  },
+)
+
+test(
+  '缓存读失败只是这一次失败，后续渲染会再试',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    // 第一次读 store 被拒（临时故障）：不能当作永久空缓存，
+    // 否则本次会话再也不会跨会话复用旧译文。
+    const clock = mock.clock(on)
+    let cacheReads = 0
+    on(
+      'store.get',
+      { key: 'cache' },
+      ($inner, e, next) => {
+        cacheReads += 1
+        if (cacheReads === 1) return { deny: 'transient-failure' }
+        return next(e)
+      },
+    )
+    mock.store(on)
+    registerRenderBottoms(on)
+    installModel(on, () => translated('这是助手的回复。'))
+
+    await $.ui.render(assistantInput('First reply from the assistant.'))
+    // 第一次读失败后不应记忆：第二次渲染还要再读一次 store。
+    await $.ui.render(assistantInput('Second reply from the assistant.'))
+
+    expect(cacheReads).toBe(2)
+    await clock.settle()
   },
 )
 

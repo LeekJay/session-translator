@@ -195,7 +195,7 @@ function failed(reason: string): TranslationCacheEntry {
   return { status: 'failed', reason }
 }
 
-function describeError(error: unknown): string {
+export function describeError(error: unknown): string {
   return error instanceof Error ? error.message : 'unknown-error'
 }
 

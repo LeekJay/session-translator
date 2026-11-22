@@ -31,6 +31,7 @@ import { containsTable, fitTables } from './tables'
 import { JSON_RETRY_PROMPT, PROMPT_TAG } from './prompt'
 import {
   cacheKey,
+  describeError,
   finalizeTranslation,
   isTransientFailure,
   isTranslationCache,
@@ -114,14 +115,19 @@ async function readPersistedCache(
 
   try {
     const saved = await $.store.get(CACHE_STORE_KEY)
-    if (isTranslationCache(saved)) {
-      persistedCache = persistableCache(saved)
-      return persistedCache
-    }
+    // 读成功但为空或格式不对：确实没有可复用缓存，记成空表。
+    // 读 store 发生在每条助手消息的渲染路径上，不记住会每次都再读一遍；
+    // 空表对 mergeCaches 与恢复逻辑等价。读期间持久化可能已写入结果，
+    // 空表不覆盖它。
+    persistedCache = isTranslationCache(saved)
+      ? persistableCache(saved)
+      : (persistedCache ?? {})
+    return persistedCache
   } catch {
-    // store 不可用时只影响跨会话复用，当前会话照常翻译。
+    // 读失败只是这一次失败，可能还有可复用缓存；不记忆空表，
+    // 下次渲染再试，避免一次临时故障让整个会话都不再跨会话复用。
+    return {}
   }
-  return {}
 }
 
 function schedulePersist($: EngineInterface): void {
@@ -139,7 +145,7 @@ function schedulePersist($: EngineInterface): void {
         persistedCache = merged
         await $.store.set(CACHE_STORE_KEY, merged)
       } catch (error) {
-        const reason = error instanceof Error ? error.message : 'unknown-error'
+        const reason = describeError(error)
         safeLog($, `翻译缓存持久化失败：${reason}`)
       }
     })
@@ -148,17 +154,10 @@ function schedulePersist($: EngineInterface): void {
   }
 }
 
-const ORIGINALS_STORE_KEY = 'originals'
+// 每条原文单独占一个 key：多个会话共用一个 store 时，各自只写自己那条消息，
+// 不会像整表回写那样互相覆盖丢数据。
+const ORIGINALS_KEY_PREFIX = 'originals:'
 const MAX_ORIGINAL_PROMPTS = 2000
-
-function isOriginalPrompts(value: unknown): value is OriginalPrompts {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    return false
-  }
-  return Object.values(value as Record<string, unknown>).every(
-    entry => typeof entry === 'string',
-  )
-}
 
 function pruneOriginals(map: OriginalPrompts): OriginalPrompts {
   const keys = Object.keys(map)
@@ -172,37 +171,78 @@ function pruneOriginals(map: OriginalPrompts): OriginalPrompts {
   return kept
 }
 
-let persistedOriginals: OriginalPrompts | undefined
-
-async function readPersistedOriginals(
-  $: EngineInterface,
-): Promise<OriginalPrompts> {
-  if (persistedOriginals !== undefined) return persistedOriginals
-
-  try {
-    const saved = await $.store.get(ORIGINALS_STORE_KEY)
-    if (isOriginalPrompts(saved)) {
-      persistedOriginals = pruneOriginals(saved)
-      return persistedOriginals
-    }
-  } catch {
-    // store 不可用时只影响 --resume 后的原文显示，当前会话仍用 $.state。
-  }
-  return {}
+function storedOriginalKey(messageId: string): string {
+  return `${ORIGINALS_KEY_PREFIX}${messageId}`
 }
 
-async function persistOriginals($: EngineInterface): Promise<void> {
+async function persistOriginal(
+  $: EngineInterface,
+  messageId: string,
+  original: string,
+): Promise<void> {
   try {
-    const entries = await read($, originals)
-    const merged = pruneOriginals({
-      ...(persistedOriginals ?? {}),
-      ...entries,
-    })
-    persistedOriginals = merged
-    await $.store.set(ORIGINALS_STORE_KEY, merged)
+    await $.store.set(storedOriginalKey(messageId), original)
   } catch (error) {
-    const reason = error instanceof Error ? error.message : 'unknown-error'
+    const reason = describeError(error)
     safeLog($, `原文映射持久化失败：${reason}`)
+  }
+}
+
+// 会话开始时按前缀逐条取回；keys() 按插入顺序返回，最旧的排在前面，
+// 超出上限时从最旧的开始删。忽略旧版本的整表 'originals' 键。
+// 旧版本把原文存成一个整表 'originals' 键；升级后仍读它，否则旧会话
+// --resume 后原文全部丢失。新格式的逐条键优先级更高。
+const LEGACY_ORIGINALS_KEY = 'originals'
+
+async function readLegacyOriginals(
+  $: EngineInterface,
+): Promise<OriginalPrompts> {
+  try {
+    const saved = await $.store.get(LEGACY_ORIGINALS_KEY)
+    if (saved === null || typeof saved !== 'object' || Array.isArray(saved)) {
+      return {}
+    }
+    const out: OriginalPrompts = {}
+    for (const [messageId, value] of Object.entries(saved)) {
+      if (typeof value === 'string') out[messageId] = value
+    }
+    return out
+  } catch {
+    // 旧格式读不到只影响旧会话的原文显示，不影响新格式。
+    return {}
+  }
+}
+
+async function loadStoredOriginals($: EngineInterface): Promise<void> {
+  try {
+    const legacy = await readLegacyOriginals($)
+    const keys = (await $.store.keys()).filter(key =>
+      key.startsWith(ORIGINALS_KEY_PREFIX),
+    )
+    const values = await Promise.all(keys.map(key => $.store.get(key)))
+
+    // 先铺旧格式，再用逐条键覆盖：同一消息 ID 以新格式为准。
+    const saved: OriginalPrompts = { ...legacy }
+    for (let index = 0; index < keys.length; index += 1) {
+      const value = values[index]
+      if (typeof value !== 'string') continue
+      const messageId = keys[index]!.slice(ORIGINALS_KEY_PREFIX.length)
+      saved[messageId] = value
+    }
+
+    if (Object.keys(saved).length > 0) {
+      await update($, originals, current =>
+        pruneOriginals({ ...saved, ...current }),
+      )
+    }
+
+    // keys() 按插入顺序返回，超出的部分是最旧的，从前面开始删。
+    const excess = keys.length - MAX_ORIGINAL_PROMPTS
+    for (const key of keys.slice(0, Math.max(0, excess))) {
+      await $.store.delete(key)
+    }
+  } catch {
+    // store 不可用时只影响 --resume 后的原文显示。
   }
 }
 
@@ -351,7 +391,7 @@ async function configRowsText($: EngineInterface): Promise<string> {
           .map(row => `${row.key}=${JSON.stringify(row.value)}`)
           .join('\n')}`
   } catch (error) {
-    const reason = error instanceof Error ? error.message : 'unknown-error'
+    const reason = describeError(error)
     return `config rows: unavailable (${reason})`
   }
 }
@@ -448,7 +488,7 @@ async function translate(
     }
     return finalizeTranslation(prepared, retry)
   } catch (error) {
-    const reason = error instanceof Error ? error.message : 'unknown-error'
+    const reason = describeError(error)
     return { status: 'failed', reason }
   }
 }
@@ -482,9 +522,13 @@ async function translateQuestions(
       return { status: 'failed', reason: 'unusable-questions' }
     }
     // header 和选项标签很短，可能合法保留 API 这类拉丁词，因此跳过。
+    // 长条目还要比对原文长度：模型把长问题截成半句时宁可画原文。
     for (let index = 0; index < translations.length; index += 1) {
-      if (item.texts[index]!.length <= LONG_DIALOG_TEXT_LENGTH) continue
-      if (!isUsableTranslation(translations[index]!, item.target)) {
+      const source = item.texts[index]!
+      if (source.length <= LONG_DIALOG_TEXT_LENGTH) continue
+      if (
+        !isUsableTranslation(translations[index]!, item.target, source.length)
+      ) {
         return { status: 'failed', reason: 'wrong-language' }
       }
     }
@@ -494,7 +538,7 @@ async function translateQuestions(
       text: JSON.stringify({ translations }),
     }
   } catch (error) {
-    const reason = error instanceof Error ? error.message : 'unknown-error'
+    const reason = describeError(error)
     return { status: 'failed', reason }
   }
 }
@@ -568,7 +612,7 @@ async function commit(
     await update($, cache, current => pruneCache({ ...current, [key]: entry }))
     schedulePersist($)
   } catch (error) {
-    const reason = error instanceof Error ? error.message : 'unknown-error'
+    const reason = describeError(error)
     safeLog($, `${label}翻译未写入缓存：${reason}`)
   } finally {
     pending.delete(key)
@@ -627,16 +671,7 @@ export const register: Register = (on, options) => {
       // 读取失败时从空缓存开始，回复照常翻译。
     }
 
-    try {
-      const savedOriginals = await readPersistedOriginals($)
-      if (Object.keys(savedOriginals).length > 0) {
-        await update($, originals, current =>
-          pruneOriginals({ ...savedOriginals, ...current }),
-        )
-      }
-    } catch {
-      // 读取失败只影响 --resume 后的原文显示。
-    }
+    await loadStoredOriginals($)
 
     try {
       await $.command.register({
@@ -679,7 +714,7 @@ export const register: Register = (on, options) => {
 
       return { text: lines.join('\n') }
     } catch (error) {
-      const reason = error instanceof Error ? error.message : 'unknown-error'
+      const reason = describeError(error)
       return { text: `translator-test failed: ${reason}` }
     }
   })
@@ -774,7 +809,7 @@ export const register: Register = (on, options) => {
 
       return { text: USAGE_LINE }
     } catch (error) {
-      const reason = error instanceof Error ? error.message : 'unknown-error'
+      const reason = describeError(error)
       return { text: `translator failed: ${reason}` }
     }
   })
@@ -795,7 +830,6 @@ export const register: Register = (on, options) => {
 
     const originKind = e.origin?.kind ?? 'unclassified'
     if (!TRANSLATABLE_ORIGINS.has(originKind)) return next(e)
-    if (e.text.length > MAX_INPUT_LENGTH) return next(e)
     if (
       !shouldTranslate(
         e.text,
@@ -804,6 +838,10 @@ export const register: Register = (on, options) => {
       )
     ) {
       return next(e)
+    }
+    // 这段文本本该翻译，放行原文会把它交给主模型，违背替换模式；只能丢弃。
+    if (e.text.length > MAX_INPUT_LENGTH) {
+      return { drop: '提示过长（超过 20000 字符），未能翻译。请拆成几段后重试。' }
     }
 
     safeStatus($, '翻译中…')
@@ -903,8 +941,7 @@ export const register: Register = (on, options) => {
       if (typeof messageId !== 'string') return next(e)
 
       const map = await read($, originals)
-      const original =
-        map[messageId] ?? (await readPersistedOriginals($))[messageId]
+      const original = map[messageId]
       if (original === undefined) return next(e)
 
       return next({ ...e, props: { ...e.props, text: original } })
@@ -1109,7 +1146,7 @@ export const register: Register = (on, options) => {
       await update($, originals, current =>
         pruneOriginals({ ...current, [messageId]: item.original }),
       )
-      await persistOriginals($)
+      await persistOriginal($, messageId, item.original)
     } catch {
       // 映射失败只影响查看；记录和翻译本身不受影响。
     }
