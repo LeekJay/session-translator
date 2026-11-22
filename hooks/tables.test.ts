@@ -64,3 +64,12 @@ test('含长链接的窄中文表格保持表格', {}, async () => {
     '| 名称 | 文档 |\n|---|---|\n| 指南 | [查看](https://example.com/very/long/url/path/that/exceeds/viewport/width) |'
   expect(fitTables(text, 40)).toBe(text)
 })
+
+test('无尾部边框且以转义竖线结尾的行保留转义竖线', {}, async () => {
+  const note = '生成的技能副本同步（英文翻译）与该功能无关'.repeat(3)
+  const text = `| 区域 | 说明 |\n|---|---|\n| 客户端 | ${note}\\|`
+  const output = fitTables(text, 40)
+
+  expect(output).toContain(`${note}\\|`)
+  expect(output.includes('|---|')).toBe(false)
+})

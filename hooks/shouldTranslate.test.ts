@@ -11,6 +11,11 @@ test('英语短命令不额外翻译', {}, async () => {
   expect(shouldTranslate('fix this', 'en', '')).toBe(false)
 })
 
+test('含 die 或 EST 的英语正文不误判为非英语', {}, async () => {
+  expect(shouldTranslate('Why did the process die?', 'en', '')).toBe(false)
+  expect(shouldTranslate('Run at 3pm EST', 'en', '')).toBe(false)
+})
+
 test('法语正文翻译成英语', {}, async () => {
   expect(
     shouldTranslate('Bonjour, je veux refactorer le module de paiement.', 'en', ''),

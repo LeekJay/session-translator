@@ -4,6 +4,7 @@ import { isUsableTranslation } from './languages'
 import {
   cacheKey,
   finalizeTranslation,
+  isSlashCommand,
   persistableCache,
   prepareTranslation,
   pruneCache,
@@ -83,4 +84,11 @@ test('长英文译为较短中文时不误判为截断，严重截断仍失败',
 
   expect(isUsableTranslation(normalZh, 'zh', sourceLength)).toBe(true)
   expect(isUsableTranslation(truncatedZh, 'zh', sourceLength)).toBe(false)
+})
+
+test('斜杠命令仅匹配字母开头的命令名', {}, async () => {
+  expect(isSlashCommand('/help')).toBe(true)
+  expect(isSlashCommand('/pstack:poteto-mode')).toBe(true)
+  expect(isSlashCommand('/123 你好')).toBe(false)
+  expect(isSlashCommand('/-flag 这是什么')).toBe(false)
 })

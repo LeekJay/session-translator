@@ -1712,6 +1712,31 @@ test(
 )
 
 test(
+  '永久翻译失败不会触发缓存持久化写入',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    const clock = mock.clock(on)
+    let persistCalls = 0
+    on('store.get', { key: 'cache' }, () => ({ value: undefined }))
+    on('store.set', { key: 'cache' }, () => {
+      persistCalls += 1
+      return { value: undefined }
+    })
+    registerRenderBottoms(on)
+    const calls = installModel(on, () => 'not valid json')
+
+    await $.ui.render(assistantInput('Reply that fails to parse.'))
+    await clock.advance(1)
+    await clock.settle()
+    await clock.advance(1000)
+    await clock.settle()
+
+    expect(calls()).toBe(2)
+    expect(persistCalls).toBe(0)
+  },
+)
+
+test(
   'session.start 再次触发时会重新读取 store 里的新缓存，不复用旧内存缓存',
   { options: { translateOutput: true, outputLanguage: 'zh' } },
   async ($, on) => {

@@ -22,6 +22,7 @@ import {
   cacheKey,
   describeError,
   finalizeTranslation,
+  isSlashCommand,
   isTransientFailure,
   mergeCaches,
   prepareTranslation,
@@ -65,6 +66,7 @@ export {
   applyStoredSettings,
   settingsPayload,
   describeSettings,
+  isSlashCommand,
 }
 
 const cache = atom(
@@ -84,12 +86,6 @@ const TRANSLATABLE_ORIGINS: ReadonlySet<string> = new Set([
   'slack-ping',
   'unclassified',
 ])
-
-const SLASH_COMMAND_PATTERN = /^\s*\/[A-Za-z0-9_:-]+(?:\s|$)/
-
-export function isSlashCommand(text: string): boolean {
-  return SLASH_COMMAND_PATTERN.test(text)
-}
 
 async function translateInputWithRetry(
   $: EngineInterface,
@@ -431,7 +427,7 @@ async function commit(
     }
 
     await update($, cache, current => pruneCache({ ...current, [key]: entry }))
-    schedulePersist($, storage)
+    if (entry.status === 'translated') schedulePersist($, storage)
   } catch (error) {
     const reason = describeError(error)
     safeLog($, `${label}翻译未写入缓存：${reason}`)

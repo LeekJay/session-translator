@@ -138,7 +138,11 @@ export function persistableCache(cache: TranslationCache): TranslationCache {
 
 // 只把 /命令 当命令跳过；/var/... 这类路径开头的正文照常翻译。
 // 命令名可以带命名空间，例如 /pstack:poteto-mode。
-const SLASH_COMMAND = /^\/[A-Za-z][\w:-]*(?:\s|$)/
+const SLASH_COMMAND = /^\s*\/[A-Za-z][\w:-]*(?:\s|$)/
+
+export function isSlashCommand(text: string): boolean {
+  return SLASH_COMMAND.test(text)
+}
 
 // 纯 JSON 文档（对象或数组）按结构化数据处理，不翻译；JSON 后跟正文时
 // JSON.parse 会失败，仍按普通正文处理。纯数字/字符串没有可翻译正文，
@@ -177,7 +181,7 @@ export function shouldTranslate(
 ): boolean {
   const trimmed = text.trim()
   if (trimmed.length === 0) return false
-  if (SLASH_COMMAND.test(trimmed)) return false
+  if (isSlashCommand(trimmed)) return false
   if (isJsonDocument(trimmed)) return false
 
   const protectedText = protectText(text)

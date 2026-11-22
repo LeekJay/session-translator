@@ -8,7 +8,7 @@ function isRow(line: string): boolean {
 function splitRow(line: string): string[] {
   let text = line.trim()
   if (text.startsWith('|')) text = text.slice(1)
-  if (text.endsWith('|')) text = text.slice(0, -1)
+  if (/(?<!\\)\|$/.test(text)) text = text.slice(0, -1)
   return text.split(/(?<!\\)\|/).map(cell => cell.trim())
 }
 

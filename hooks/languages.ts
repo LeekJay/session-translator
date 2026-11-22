@@ -37,11 +37,11 @@ const LATIN = /^\p{Script=Latin}$/u
 const LATIN_ACCENT = /[\u00C0-\u024F\u1E00-\u1EFF]/
 const LATIN_WORD = /[\p{Script=Latin}]+/gu
 
-// 法语和德语的常用虚词。命中一个就说明不是英语，宁可多翻一次也不漏翻。
+// 法语和德语的常用虚词（排除 die、est 等常见英语词/缩写）。命中一个就说明不是英语，宁可多翻一次也不漏翻。
 const NON_ENGLISH_MARKERS: ReadonlySet<string> = new Set([
-  'le', 'la', 'les', 'du', 'et', 'est', 'pas', 'pour', 'dans', 'avec',
+  'le', 'la', 'les', 'du', 'et', 'pas', 'pour', 'dans', 'avec',
   'sur', 'que', 'qui', 'je', 'tu', 'nous', 'vous', 'aux', 'une',
-  'der', 'die', 'das', 'den', 'dem', 'des', 'und', 'ist', 'nicht',
+  'der', 'das', 'den', 'dem', 'des', 'und', 'ist', 'nicht',
   'mit', 'für', 'von', 'zu', 'ein', 'eine', 'ich', 'wir', 'sie',
   'auf', 'auch',
 ])
