@@ -6,7 +6,14 @@ import type {
   RenderInput,
 } from 'claude-code'
 import { PROMPT_TAG } from './prompt'
-import { scheduleTranslation } from './register'
+import {
+  applyStoredSettings,
+  describeSettings,
+  scheduleTranslation,
+  SETTING_KEYS,
+  settingsPayload,
+} from './register'
+import type { Options } from './register'
 import { cacheKey, translationSignature } from './translate'
 
 const USAGE = {
@@ -419,6 +426,110 @@ test(
 
     await $.tool.call({ tool: 'AskUserQuestion', questions })
     expect(calls()).toBe(1)
+  },
+)
+
+test(
+  '选择对话框的长问题译文语言不对时画原文',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    const clock = mock.clock(on)
+    let asked: Array<Record<string, unknown>> = []
+
+    on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
+      asked = e.questions as Array<Record<string, unknown>>
+      const first = asked[0]!
+      const key = String(first.question)
+      const options = first.options as Array<Record<string, unknown>>
+      return {
+        result: { questions: e.questions, answers: { [key]: options[0]!.label } },
+      }
+    })
+
+    const calls = installModel(
+      on,
+      () =>
+        '{"translations":["Which API?","API","REST","用 REST 完成集成。","GraphQL","用 GraphQL 完成集成。"]}',
+    )
+
+    const questions = [
+      {
+        question: 'Which API should the client use for this integration?',
+        header: 'API',
+        multiSelect: false,
+        options: [
+          { label: 'REST', description: 'Use the REST API for the integration.' },
+          {
+            label: 'GraphQL',
+            description: 'Use the GraphQL API for the integration.',
+          },
+        ],
+      },
+    ]
+
+    await $.tool.call({ tool: 'AskUserQuestion', questions })
+
+    expect(calls()).toBe(1)
+    expect(asked).toEqual(questions)
+
+    await clock.advance(1)
+    await clock.settle()
+
+    await $.tool.call({ tool: 'AskUserQuestion', questions })
+    expect(calls()).toBe(1)
+    expect(asked).toEqual(questions)
+  },
+)
+
+test(
+  '选择对话框的长问题正常翻译时短 header 和标签不误判',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    const clock = mock.clock(on)
+    let asked: Array<Record<string, unknown>> = []
+
+    on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
+      asked = e.questions as Array<Record<string, unknown>>
+      const first = asked[0]!
+      const key = String(first.question)
+      const options = first.options as Array<Record<string, unknown>>
+      return {
+        result: { questions: e.questions, answers: { [key]: options[0]!.label } },
+      }
+    })
+
+    const calls = installModel(
+      on,
+      () =>
+        '{"translations":["服务集成应该使用哪个 API？","API","REST","用 REST API 完成集成。","GraphQL","用 GraphQL API 完成集成。"]}',
+    )
+
+    const questions = [
+      {
+        question: 'Which API should the service use for this integration?',
+        header: 'API',
+        multiSelect: false,
+        options: [
+          { label: 'REST', description: 'Use the REST API for the integration.' },
+          {
+            label: 'GraphQL',
+            description: 'Use the GraphQL API for the integration.',
+          },
+        ],
+      },
+    ]
+
+    await $.tool.call({ tool: 'AskUserQuestion', questions })
+
+    expect(calls()).toBe(1)
+    expect(asked[0]?.question).toBe('服务集成应该使用哪个 API？')
+    expect(asked[0]?.header).toBe('API')
+    const options = asked[0]?.options as Array<Record<string, unknown>>
+    expect(options[0]?.label).toBe('REST')
+    expect(options[1]?.label).toBe('GraphQL')
+
+    await clock.advance(1)
+    await clock.settle()
   },
 )
 
@@ -1050,6 +1161,38 @@ test(
 )
 
 test(
+  '排队翻译期间切换输出语言，译文按渲染时的语言写入缓存',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    const clock = mock.clock(on)
+    mock.store(on)
+    registerRenderBottoms(on)
+    const calls = installModel(on, (_source, system) =>
+      system.includes('Japanese')
+        ? translated('これはテストです')
+        : translated('这是中文译文。'),
+    )
+    const source = 'This is the assistant reply.'
+
+    const first = await $.ui.render(assistantInput(source))
+    expect(drawnText(first)).toBe(source)
+    expect(calls()).toBe(0)
+
+    // 译文还在排队时切到日文；排队任务应仍按渲染时的中文设置翻译。
+    await $.command.run({ command: 'translator', args: 'output ja' })
+
+    await clock.advance(1)
+    await clock.settle()
+    expect(calls()).toBe(1)
+
+    // 切回中文后，旧 key 里必须是中文译文，而不是排队期间新设置的日文译文。
+    await $.command.run({ command: 'translator', args: 'output zh' })
+    const second = await $.ui.render(assistantInput(source))
+    expect(drawnText(second)).toBe('这是中文译文。')
+  },
+)
+
+test(
   'btw 侧问要求按输出语言回答',
   { options: { translateOutput: true, outputLanguage: 'zh' } },
   async ($, on) => {
@@ -1221,6 +1364,47 @@ test(
     expect(reply.text).not.toContain('outputLanguage=zh')
   },
 )
+
+test('每个设置键都能持久化、恢复并显示在 status 里', {}, async () => {
+  const defaults: Options = {
+    translateInput: true,
+    inputLanguage: 'en',
+    translateOutput: true,
+    outputLanguage: 'zh',
+    model: 'haiku',
+    translationRules: '',
+  }
+  const config: Options = {
+    translateInput: false,
+    inputLanguage: 'ja',
+    translateOutput: false,
+    outputLanguage: 'en',
+    model: 'sonnet',
+    translationRules: '- 保留术语',
+  }
+
+  const payload = settingsPayload(config)
+  const lines = describeSettings(config)
+
+  expect(Object.keys(payload)).toEqual([...SETTING_KEYS])
+  expect(lines).toEqual([
+    'translateInput=false',
+    'inputLanguage=ja',
+    'translateOutput=false',
+    'outputLanguage=en',
+    'model=sonnet',
+    'translationRules=- 保留术语',
+  ])
+
+  for (const key of SETTING_KEYS) {
+    // 每个键都取非默认值，否则回退到默认值也能让往返测试通过。
+    expect(config[key]).not.toEqual(defaults[key])
+    expect(payload[key]).toEqual(config[key])
+    expect(lines.some(line => line.startsWith(`${key}=`))).toBe(true)
+  }
+
+  expect(applyStoredSettings(defaults, payload)).toEqual(config)
+})
 
 test('时钟缺失或抛错时清掉 pending，下一次还能重试', {}, async () => {
   const key = 'schedule-failure-retry'

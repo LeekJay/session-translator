@@ -44,6 +44,9 @@ import type { TranslateOptions } from './translate'
 
 const MAX_INPUT_LENGTH = 20_000
 
+// 对话框里超过这个长度的文本是问题/说明，必须真的翻成目标语言。
+const LONG_DIALOG_TEXT_LENGTH = 20
+
 const TRANSLATABLE_ORIGINS: ReadonlySet<string> = new Set([
   'composer',
   'bridge',
@@ -128,7 +131,7 @@ function schedulePersist($: EngineInterface): void {
   }
 }
 
-type Options = {
+export type Options = {
   readonly translateInput: boolean
   readonly inputLanguage: TranslationLanguage
   readonly translateOutput: boolean
@@ -145,6 +148,10 @@ const DEFAULTS: Options = {
   model: 'haiku',
   translationRules: '',
 }
+
+// settingsPayload 和 describeSettings 共用的键清单：直接从 DEFAULTS 派生。
+// 加新设置时 Options 类型和 DEFAULTS 会先让编译器报错，这里无需再改。
+export const SETTING_KEYS = Object.keys(DEFAULTS) as (keyof Options)[]
 
 type PendingTranslation = {
   readonly key: string
@@ -229,7 +236,10 @@ function readOptions(options: PluginOptions): Options {
   return normalizeOptions(options, DEFAULTS)
 }
 
-function applyStoredSettings(current: Options, saved: unknown): Options {
+export function applyStoredSettings(
+  current: Options,
+  saved: unknown,
+): Options {
   if (saved === null || typeof saved !== 'object' || Array.isArray(saved)) {
     return current
   }
@@ -237,30 +247,22 @@ function applyStoredSettings(current: Options, saved: unknown): Options {
   return normalizeOptions(saved as PluginOptions, current)
 }
 
-function settingsPayload(config: Options): Record<string, unknown> {
-  return {
-    translateInput: config.translateInput,
-    inputLanguage: config.inputLanguage,
-    translateOutput: config.translateOutput,
-    outputLanguage: config.outputLanguage,
-    model: config.model,
-    translationRules: config.translationRules,
-  }
+export function settingsPayload(config: Options): Record<string, unknown> {
+  return Object.fromEntries(
+    SETTING_KEYS.map(key => [key, config[key]] as const),
+  )
 }
 
-function describeSettings(config: Options): string[] {
-  return [
-    `translateInput=${config.translateInput}`,
-    `inputLanguage=${config.inputLanguage}`,
-    `translateOutput=${config.translateOutput}`,
-    `outputLanguage=${config.outputLanguage}`,
-    `model=${config.model}`,
-    `translationRules=${
-      config.translationRules.trim().length > 0
-        ? config.translationRules
-        : '(empty)'
-    }`,
-  ]
+export function describeSettings(config: Options): string[] {
+  return SETTING_KEYS.map(key =>
+    key === 'translationRules'
+      ? `translationRules=${
+          config.translationRules.trim().length > 0
+            ? config.translationRules
+            : '(empty)'
+        }`
+      : `${key}=${config[key]}`,
+  )
 }
 
 async function configRowsText($: EngineInterface): Promise<string> {
@@ -385,6 +387,13 @@ async function translateQuestions(
     const translations = parseQuestionsResponse(result.text)
     if (translations === undefined || translations.length !== item.texts.length) {
       return { status: 'failed', reason: 'unusable-questions' }
+    }
+    // header 和选项标签很短，可能合法保留 API 这类拉丁词，因此跳过。
+    for (let index = 0; index < translations.length; index += 1) {
+      if (item.texts[index]!.length <= LONG_DIALOG_TEXT_LENGTH) continue
+      if (!isUsableTranslation(translations[index]!, item.target)) {
+        return { status: 'failed', reason: 'wrong-language' }
+      }
     }
     // 存信封形态，读取时和模型原始回复走同一个解析器。
     return {
@@ -724,39 +733,36 @@ export const register: Register = (on, options) => {
     let rewritten: string | undefined
 
     try {
-      if (runtime.config.translateOutput) {
+      // 排队翻译期间设置可能改变；key 和译文参数必须来自同一份快照。
+      const config = runtime.config
+      const signature = runtime.signature
+      if (config.translateOutput) {
         const source = e.props.text
         if (
           shouldTranslate(
             source,
-            runtime.config.outputLanguage,
-            runtime.config.translationRules,
+            config.outputLanguage,
+            config.translationRules,
           )
         ) {
-          const key = cacheKey(
-            runtime.signature,
-            runtime.config.outputLanguage,
-            'output',
-            source,
-          )
+          const item: PendingTranslation = {
+            key: cacheKey(signature, config.outputLanguage, 'output', source),
+            text: source,
+            target: config.outputLanguage,
+            translationRules: config.translationRules,
+            model: config.model,
+          }
           const entries = await read($, cache)
           const entry =
-            entries[key] ?? (await readPersistedCache($))[key]
+            entries[item.key] ?? (await readPersistedCache($))[item.key]
 
           if (entry?.status === 'translated') {
             rewritten = fitTables(entry.text, e.viewport?.columns)
           } else if (entry === undefined) {
             const outcome = scheduleTranslation(
               callback => $.clock.after(1, callback),
-              key,
-              () =>
-                run($, {
-                  key,
-                  text: source,
-                  target: runtime.config.outputLanguage,
-                  translationRules: runtime.config.translationRules,
-                  model: runtime.config.model,
-                }),
+              item.key,
+              () => run($, item),
             )
             if (outcome === 'failed') return next(e)
 
