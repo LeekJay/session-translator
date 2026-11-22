@@ -10,6 +10,11 @@ export type TranslationRequest = {
 
 export const PROMPT_TAG = 'CLAUDE_CODE_SESSION_TRANSLATION_V1'
 
+// 模型偶尔返回截断或未转义的 JSON（多行回复最容易出现）。模型格式错误时
+// 追加这段纠正说明再试一次，不改变缓存键，也不影响正常路径。
+export const JSON_RETRY_PROMPT =
+  'Your previous reply was not a single valid JSON object. Reply again with only {"translation":"..."} and nothing else. Escape every newline as \\n and every double quote as \\".'
+
 function ruleLines(rules: string): string[] {
   return rules
     .split('\n')

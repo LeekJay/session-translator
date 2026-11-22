@@ -1074,7 +1074,7 @@ test(
 )
 
 test(
-  '响应不是严格 JSON 时保留原文并缓存失败',
+  '响应始终不是严格 JSON 时重试一次后保留原文并缓存失败',
   { options: { translateOutput: true, outputLanguage: 'zh' } },
   async ($, on) => {
     const clock = mock.clock(on)
@@ -1085,13 +1085,46 @@ test(
     await $.ui.render(assistantInput(source))
     await clock.advance(1)
     await clock.settle()
+    expect(calls()).toBe(2)
 
     const second = await $.ui.render(assistantInput(source))
     expect(drawnText(second)).toBe(source)
 
     await clock.advance(1)
     await clock.settle()
-    expect(calls()).toBe(1)
+    expect(calls()).toBe(2)
+  },
+)
+
+test(
+  '首次回复不是严格 JSON 时自动重试并采用第二次译文',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    const clock = mock.clock(on)
+    registerRenderBottoms(on)
+    let calls = 0
+    const prompts: string[] = []
+    on('model.complete', ($model, e) => {
+      calls += 1
+      prompts.push(e.prompt)
+      return {
+        value: answered(
+          calls === 1 ? 'not json' : translated('这是重试后的译文。'),
+        ),
+      }
+    })
+
+    const source = 'This reply is not valid JSON.'
+    await $.ui.render(assistantInput(source))
+    await clock.advance(1)
+    await clock.settle()
+
+    expect(calls).toBe(2)
+    expect(prompts[1]).toContain('Escape every newline')
+
+    const second = await $.ui.render(assistantInput(source))
+    expect(drawnText(second)).toBe('这是重试后的译文。')
+    expect(calls).toBe(2)
   },
 )
 

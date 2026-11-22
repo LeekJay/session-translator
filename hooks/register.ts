@@ -27,7 +27,7 @@ import {
 } from './questions'
 import { contentText, goalConditionOf, replaceGoalCondition } from './goal'
 import { containsTable, fitTables } from './tables'
-import { PROMPT_TAG } from './prompt'
+import { JSON_RETRY_PROMPT, PROMPT_TAG } from './prompt'
 import {
   cacheKey,
   finalizeTranslation,
@@ -353,7 +353,25 @@ async function translate(
         reason: `${result.reason} (out=${result.usage.output_tokens}, in=${result.usage.input_tokens})`,
       }
     }
-    return finalizeTranslation(prepared, result)
+    const entry = finalizeTranslation(prepared, result)
+    if (entry.status === 'translated') return entry
+    if (!entry.reason.startsWith('malformed-response')) return entry
+
+    // 一次格式纠正重试：多行或带引号的回复偶尔会返回截断/未转义的 JSON。
+    const retry = await $.model.complete({
+      model: item.model,
+      prompt: `${prepared.prompt}\n\n${JSON_RETRY_PROMPT}`,
+      system: prepared.system,
+      maxTokens: prepared.maxTokens,
+      effort: 'low',
+    })
+    if (!retry.isAnswered) {
+      return {
+        status: 'failed',
+        reason: `${retry.reason} (out=${retry.usage.output_tokens}, in=${retry.usage.input_tokens})`,
+      }
+    }
+    return finalizeTranslation(prepared, retry)
   } catch (error) {
     const reason = error instanceof Error ? error.message : 'unknown-error'
     return { status: 'failed', reason }
