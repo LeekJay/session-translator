@@ -13,7 +13,7 @@ const CONDITION_TAIL = '".'
  */
 export function goalConditionOf(text: string): string | undefined {
   if (!text.startsWith(CONDITION_PREFIX)) return undefined
-  const end = text.indexOf(CONDITION_TAIL, CONDITION_PREFIX.length)
+  const end = text.lastIndexOf(CONDITION_TAIL)
   if (end === -1) return undefined
   const condition = text.slice(CONDITION_PREFIX.length, end)
   return condition.length > 0 ? condition : undefined

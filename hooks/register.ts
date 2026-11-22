@@ -27,12 +27,14 @@ import {
 } from './questions'
 import { contentText, goalConditionOf, replaceGoalCondition } from './goal'
 import { containsTable, fitTables } from './tables'
+import { PROMPT_TAG } from './prompt'
 import {
   cacheKey,
   finalizeTranslation,
   isTransientFailure,
   isTranslationCache,
   mergeCaches,
+  persistableCache,
   prepareTranslation,
   pruneCache,
   shouldTranslate,
@@ -55,12 +57,28 @@ const cache = atom(
   {},
 )
 
-const originals = atom(
-  { plugin: 'session-translator', key: 'originals' } as const,
-  {},
-)
-
 const pending = new Set<string>()
+
+export type ScheduleResult = 'scheduled' | 'busy' | 'failed'
+
+export type Schedule = (start: () => void) => unknown
+
+// 同一 key 只排队一次；调度抛错时清掉 pending，下一次渲染还能重试。
+export function scheduleTranslation(
+  schedule: Schedule,
+  key: string,
+  start: () => void,
+): ScheduleResult {
+  if (pending.has(key)) return 'busy'
+  pending.add(key)
+  try {
+    schedule(start)
+    return 'scheduled'
+  } catch {
+    pending.delete(key)
+    return 'failed'
+  }
+}
 
 const CACHE_STORE_KEY = 'cache'
 const PERSIST_DELAY_MS = 1000
@@ -77,8 +95,8 @@ async function readPersistedCache(
   try {
     const saved = await $.store.get(CACHE_STORE_KEY)
     if (isTranslationCache(saved)) {
-      persistedCache = saved
-      return saved
+      persistedCache = persistableCache(saved)
+      return persistedCache
     }
   } catch {
     // store 不可用时只影响跨会话复用，当前会话照常翻译。
@@ -95,7 +113,9 @@ function schedulePersist($: EngineInterface): void {
       persistScheduled = false
       try {
         const entries = await read($, cache)
-        const merged = pruneCache(mergeCaches(persistedCache, entries))
+        const merged = persistableCache(
+          pruneCache(mergeCaches(persistedCache, entries)),
+        )
         persistedCache = merged
         await $.store.set(CACHE_STORE_KEY, merged)
       } catch (error) {
@@ -169,36 +189,44 @@ function languageOption(
   return isTranslationLanguage(value) ? value : fallback
 }
 
-function readOptions(options: PluginOptions): Options {
-  const model = stringOption(options, 'model', DEFAULTS.model).trim()
+// 两个入口共用同一份读取/回退逻辑：选项用 DEFAULTS 兜底，存储设置用当前值兜底。
+function normalizeOptions(
+  source: PluginOptions,
+  fallback: Options,
+): Options {
+  const model = stringOption(source, 'model', fallback.model).trim()
   return {
     translateInput: booleanOption(
-      options,
+      source,
       'translateInput',
-      DEFAULTS.translateInput,
+      fallback.translateInput,
     ),
     inputLanguage: languageOption(
-      options,
+      source,
       'inputLanguage',
-      DEFAULTS.inputLanguage,
+      fallback.inputLanguage,
     ),
     translateOutput: booleanOption(
-      options,
+      source,
       'translateOutput',
-      DEFAULTS.translateOutput,
+      fallback.translateOutput,
     ),
     outputLanguage: languageOption(
-      options,
+      source,
       'outputLanguage',
-      DEFAULTS.outputLanguage,
+      fallback.outputLanguage,
     ),
-    model: model.length > 0 ? model : DEFAULTS.model,
+    model: model.length > 0 ? model : fallback.model,
     translationRules: stringOption(
-      options,
+      source,
       'translationRules',
-      DEFAULTS.translationRules,
+      fallback.translationRules,
     ),
   }
+}
+
+function readOptions(options: PluginOptions): Options {
+  return normalizeOptions(options, DEFAULTS)
 }
 
 function applyStoredSettings(current: Options, saved: unknown): Options {
@@ -206,37 +234,7 @@ function applyStoredSettings(current: Options, saved: unknown): Options {
     return current
   }
 
-  const record = saved as PluginOptions
-  const model = stringOption(record, 'model', current.model).trim()
-
-  return {
-    translateInput: booleanOption(
-      record,
-      'translateInput',
-      current.translateInput,
-    ),
-    inputLanguage: languageOption(
-      record,
-      'inputLanguage',
-      current.inputLanguage,
-    ),
-    translateOutput: booleanOption(
-      record,
-      'translateOutput',
-      current.translateOutput,
-    ),
-    outputLanguage: languageOption(
-      record,
-      'outputLanguage',
-      current.outputLanguage,
-    ),
-    model: model.length > 0 ? model : current.model,
-    translationRules: stringOption(
-      record,
-      'translationRules',
-      current.translationRules,
-    ),
-  }
+  return normalizeOptions(saved as PluginOptions, current)
 }
 
 function settingsPayload(config: Options): Record<string, unknown> {
@@ -346,7 +344,6 @@ async function translate(
         maxTokens: prepared.maxTokens,
         effort: 'low',
       },
-      item.signal === undefined ? undefined : { signal: item.signal },
     )
     if (!result.isAnswered) {
       return {
@@ -438,7 +435,9 @@ async function translateFreeTextAnswers(
     for (let index = 0; index < pendingTexts.length; index += 1) {
       const source = pendingTexts[index]!
       const translated = translations[index]!
-      if (isUsableTranslation(translated, target)) map.set(source, translated)
+      if (isUsableTranslation(translated, target, source.length)) {
+        map.set(source, translated)
+      }
     }
   } catch {
     // 翻不动就让模型读原文，比丢掉答案安全。
@@ -486,29 +485,31 @@ function run($: EngineInterface, item: PendingTranslation): Promise<void> {
   )
 }
 
+function signatureOf(config: Options): string {
+  return translationSignature({
+    inputLanguage: config.inputLanguage,
+    outputLanguage: config.outputLanguage,
+    model: config.model,
+    translationRules: config.translationRules,
+    promptVersion: PROMPT_TAG,
+  })
+}
+
 export const register: Register = (on, options) => {
+  // reset 回到注册时读到的插件选项，而不是硬编码默认值。
+  const initialOptions = readOptions(options)
   const runtime = {
-    config: readOptions(options),
+    config: { ...initialOptions },
     signature: '',
   }
-  runtime.signature = translationSignature({
-    inputLanguage: runtime.config.inputLanguage,
-    outputLanguage: runtime.config.outputLanguage,
-    model: runtime.config.model,
-    translationRules: runtime.config.translationRules,
-  })
+  runtime.signature = signatureOf(runtime.config)
 
   on('session.start', async ($, e, next) => {
     try {
       const saved = await $.store.get('settings')
       const stored = applyStoredSettings(runtime.config, saved)
       runtime.config = stored
-      runtime.signature = translationSignature({
-        inputLanguage: stored.inputLanguage,
-        outputLanguage: stored.outputLanguage,
-        model: stored.model,
-        translationRules: stored.translationRules,
-      })
+      runtime.signature = signatureOf(stored)
     } catch {
       // 读取失败时沿用当前设置。
     }
@@ -577,12 +578,7 @@ export const register: Register = (on, options) => {
         reply: string,
       ): Promise<{ text: string }> => {
         runtime.config = next
-        runtime.signature = translationSignature({
-          inputLanguage: next.inputLanguage,
-          outputLanguage: next.outputLanguage,
-          model: next.model,
-          translationRules: next.translationRules,
-        })
+        runtime.signature = signatureOf(next)
 
         try {
           await $.store.set('settings', settingsPayload(next))
@@ -647,14 +643,9 @@ export const register: Register = (on, options) => {
       }
 
       if (verb === 'reset') {
-        const next: Options = { ...DEFAULTS }
+        const next: Options = { ...initialOptions }
         runtime.config = next
-        runtime.signature = translationSignature({
-          inputLanguage: next.inputLanguage,
-          outputLanguage: next.outputLanguage,
-          model: next.model,
-          translationRules: next.translationRules,
-        })
+        runtime.signature = signatureOf(next)
 
         try {
           await $.store.delete('settings')
@@ -721,7 +712,7 @@ export const register: Register = (on, options) => {
         ...e,
         context: [
           ...(e.context ?? []),
-          `English translation of the user's message above:\n${entry.text}`,
+          `${languageName(runtime.config.inputLanguage)} translation of the user's message above:\n${entry.text}`,
         ],
       })
     } finally {
@@ -745,6 +736,7 @@ export const register: Register = (on, options) => {
           const key = cacheKey(
             runtime.signature,
             runtime.config.outputLanguage,
+            'output',
             source,
           )
           const entries = await read($, cache)
@@ -753,21 +745,25 @@ export const register: Register = (on, options) => {
 
           if (entry?.status === 'translated') {
             rewritten = fitTables(entry.text, e.viewport?.columns)
-          } else if (entry === undefined && !pending.has(key)) {
-            pending.add(key)
-            $.clock.after(1, () =>
-              run($, {
-                key,
-                text: source,
-                target: runtime.config.outputLanguage,
-                translationRules: runtime.config.translationRules,
-                model: runtime.config.model,
-              }),
+          } else if (entry === undefined) {
+            const outcome = scheduleTranslation(
+              callback => $.clock.after(1, callback),
+              key,
+              () =>
+                run($, {
+                  key,
+                  text: source,
+                  target: runtime.config.outputLanguage,
+                  translationRules: runtime.config.translationRules,
+                  model: runtime.config.model,
+                }),
             )
+            if (outcome === 'failed') return next(e)
 
             if (containsTable(source)) {
               // 表格消息不先画英文：终端已打印的行撤不回，等译文到了再换
               // 会把原文和译文叠在一起。先画一行占位符，译文到达后整块重绘。
+              // 翻译未完成时引擎可能重绘，这里也要继续画占位符。
               const { Text } = $.ui.resolve(e)
               return h(Text, { dimColor: true }, '翻译中…') as RenderElement
             }
@@ -805,6 +801,7 @@ export const register: Register = (on, options) => {
           const key = cacheKey(
             runtime.signature,
             runtime.config.outputLanguage,
+            'questions',
             `tool-questions\u0000${JSON.stringify(texts)}`,
           )
           const entries = await read($, cache)
@@ -845,29 +842,43 @@ export const register: Register = (on, options) => {
       translatedQuestions = undefined
     }
 
-    if (translatedQuestions === undefined) return next(e)
+    // 输入翻译只决定用户写的自由文本要不要变成模型语言；
+    // 问题/选项的改写仍由 translateOutput 控制。
+    if (
+      translatedQuestions === undefined &&
+      !runtime.config.translateInput
+    ) {
+      return next(e)
+    }
 
-    const result = await next({
-      ...e,
-      questions: translatedQuestions as typeof e.questions,
-    })
+    const result =
+      translatedQuestions === undefined
+        ? await next(e)
+        : await next({
+            ...e,
+            questions: translatedQuestions as typeof e.questions,
+          })
 
     if (!('result' in result) || result.result === undefined) return result
 
     try {
-      const freeText = await translateFreeTextAnswers(
-        $,
-        freeTextAnswers(result.result, e.questions, translatedQuestions),
-        runtime.config.inputLanguage,
-        runtime.config.translationRules,
-        runtime.config.model,
-      )
+      const drawnQuestions = translatedQuestions ?? e.questions
+      const freeText = runtime.config.translateInput
+        ? await translateFreeTextAnswers(
+            $,
+            freeTextAnswers(result.result, e.questions, drawnQuestions),
+            runtime.config.inputLanguage,
+            runtime.config.translationRules,
+            runtime.config.model,
+          )
+        : new Map<string, string>()
+
       return {
         ...result,
         result: translateAnswers(
           result.result,
           e.questions,
-          translatedQuestions,
+          drawnQuestions,
           freeText,
         ),
       }
@@ -885,6 +896,16 @@ export const register: Register = (on, options) => {
     try {
       if (!runtime.config.translateInput) return next(e)
       const content = e.message.content
+      // note 只有一个 text block 时才能整行替换；多个块会把整行复制到每个块。
+      if (Array.isArray(content)) {
+        const textBlocks = content.filter(
+          block =>
+            typeof block === 'object' &&
+            block !== null &&
+            (block as { type?: string }).type === 'text',
+        )
+        if (textBlocks.length !== 1) return next(e)
+      }
       const text = contentText(content)
       if (text === undefined) return next(e)
 
@@ -928,17 +949,4 @@ export const register: Register = (on, options) => {
       return next(e)
     }
   }).catch(($, e, next) => next(e))
-
-  on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
-    try {
-      const kind = e.props.origin.kind
-      if (kind !== 'composer' && kind !== 'bridge') return next(e)
-      const map = await read($, originals)
-      const original = map[e.props.text]
-      if (original === undefined) return next(e)
-      return next({ ...e, props: { ...e.props, text: original } })
-    } catch {
-      return next(e)
-    }
-  })
 }

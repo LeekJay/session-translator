@@ -29,6 +29,16 @@ test('条件里含引号或换行时按位置替换', {}, async () => {
   )
 })
 
+test('条件里出现引号加句号时不被截断', {}, async () => {
+  const text =
+    'A session-scoped Stop hook is now active with condition: "确保输出 "done". 然后停止". Briefly acknowledge the goal.'
+  const translation = 'Make sure the output "done". Then stop.'
+  expect(goalConditionOf(text)).toBe('确保输出 "done". 然后停止')
+  expect(replaceGoalCondition(text, translation)).toBe(
+    text.replace('确保输出 "done". 然后停止', translation),
+  )
+})
+
 test('不是目标提示行的文本原样返回', {}, async () => {
   expect(replaceGoalCondition('随便一句话', 'x')).toBe('随便一句话')
 })

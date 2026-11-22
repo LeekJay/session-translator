@@ -118,6 +118,161 @@ test('收集用户手输的自由答案，跳过选项标签', {}, async () => {
   ])
 })
 
+test('对象形态的备注保留结构，只翻译 notes', {}, async () => {
+  const translated = rewriteQuestions(QUESTIONS, [
+    '用哪个测试库？',
+    '测试库',
+    '维特',
+    '快。',
+    '杰斯特',
+    '常用。',
+  ]) as unknown[]
+
+  const note = '我在 Windows 上开发'
+  const noteEnglish = 'I develop on Windows'
+  const result = {
+    questions: translated,
+    annotations: {
+      '用哪个测试库？': {
+        notes: note,
+        preview: 'vitest run',
+        unanswered: 'dismissed',
+      },
+    },
+  }
+
+  expect(freeTextAnswers(result, QUESTIONS, translated)).toEqual([note])
+
+  const back = translateAnswers(
+    result,
+    QUESTIONS,
+    translated,
+    new Map([[note, noteEnglish]]),
+  ) as Record<string, unknown>
+
+  expect(back.annotations).toEqual({
+    'Which library should we use?': {
+      notes: noteEnglish,
+      preview: 'vitest run',
+      unanswered: 'dismissed',
+    },
+  })
+})
+
+test('两句的选项译名相同时各按本句标签还原', {}, async () => {
+  const questions = [
+    {
+      question: 'Enable feature?',
+      options: [{ label: 'Enable' }, { label: 'Disable' }],
+    },
+    {
+      question: 'Turn it on?',
+      options: [{ label: 'Turn on' }, { label: 'Turn off' }],
+    },
+  ]
+  const translated = rewriteQuestions(questions, [
+    '开启功能？',
+    '开启',
+    '关闭',
+    '要打开吗？',
+    '开启',
+    '关闭',
+  ]) as unknown[]
+
+  const result = {
+    questions: translated,
+    answers: {
+      '开启功能？': '开启',
+      '要打开吗？': '开启',
+    },
+    annotations: {
+      '开启功能？': {
+        notes: '先备份',
+        preview: 'enable --now',
+        unanswered: 'dismissed',
+      },
+    },
+    response: '开启',
+  }
+
+  // response 的“开启”在两道题里指向不同原文，不能当标签，按自由文本收集。
+  expect(freeTextAnswers(result, questions, translated)).toEqual([
+    '先备份',
+    '开启',
+  ])
+
+  const back = translateAnswers(
+    result,
+    questions,
+    translated,
+    new Map([['先备份', 'back up first']]),
+  ) as Record<string, unknown>
+
+  expect(back.answers).toEqual({
+    'Enable feature?': 'Enable',
+    'Turn it on?': 'Turn on',
+  })
+  expect(back.annotations).toEqual({
+    'Enable feature?': {
+      notes: 'back up first',
+      preview: 'enable --now',
+      unanswered: 'dismissed',
+    },
+  })
+  // 歧义标签不参与合并映射，response 不会被错绑到某一道题。
+  expect(back.response).toBe('开启')
+})
+
+test('无问题归属的 response 不会被跨问题重名标签错绑', {}, async () => {
+  const questions = [
+    {
+      question: 'Enable feature?',
+      options: [{ label: 'Enable' }, { label: 'Disable' }],
+    },
+    {
+      question: 'Turn it on?',
+      options: [{ label: 'Turn on' }, { label: 'Turn off' }],
+    },
+  ]
+  const translated = rewriteQuestions(questions, [
+    '开启功能？',
+    '开启',
+    '关闭',
+    '要打开吗？',
+    '开启',
+    '关闭',
+  ]) as unknown[]
+
+  const result = {
+    questions: translated,
+    answers: { '开启功能？': '开启', '要打开吗？': '开启' },
+    response: '开启',
+  }
+
+  const back = translateAnswers(
+    result,
+    questions,
+    translated,
+  ) as Record<string, unknown>
+  expect(back.answers).toEqual({
+    'Enable feature?': 'Enable',
+    'Turn it on?': 'Turn on',
+  })
+  expect(back.response).toBe('开启')
+
+  const backWithFreeText = translateAnswers(
+    result,
+    questions,
+    translated,
+    new Map([['开启', 'Enabled']]),
+  ) as Record<string, unknown>
+  expect(backWithFreeText.answers).toEqual({
+    'Enable feature?': 'Enable',
+    'Turn it on?': 'Turn on',
+  })
+  expect(backWithFreeText.response).toBe('Enabled')
+})
+
 test('自由答案按整串翻译回填，不拆逗号', {}, async () => {
   const translated = rewriteQuestions(QUESTIONS, [
     '用哪个测试库？',

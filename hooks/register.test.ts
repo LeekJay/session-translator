@@ -5,6 +5,8 @@ import type {
   RenderElement,
   RenderInput,
 } from 'claude-code'
+import { PROMPT_TAG } from './prompt'
+import { scheduleTranslation } from './register'
 import { cacheKey, translationSignature } from './translate'
 
 const USAGE = {
@@ -124,6 +126,29 @@ test(
     expect(calls()).toBe(1)
     expect(reached).toBe('请帮我看看这个文件')
     expect(context?.join('\n')).toContain('Hello from the test')
+  },
+)
+
+test(
+  '输入语言不是英语时 context 标签跟随模型语言',
+  { options: { translateInput: true, inputLanguage: 'ja' } },
+  async ($, on) => {
+    let context: readonly string[] | undefined
+    const calls = installModel(on, () => translated('これはテストです'))
+    on('prompt.submit', ($, e) => {
+      context = e.context
+      return { text: e.text }
+    })
+
+    await $.prompt.submit({
+      text: '请帮我看看这个文件',
+      wait: false,
+      origin: { kind: 'composer' },
+    })
+
+    expect(calls()).toBe(1)
+    expect(context?.join('\n')).toContain('Japanese translation')
+    expect(context?.join('\n')).not.toContain('English translation')
   },
 )
 
@@ -289,6 +314,38 @@ test(
 )
 
 test(
+  '表格消息翻译未完成时重绘仍显示占位符',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    const clock = mock.clock(on)
+    registerRenderBottoms(on)
+    const calls = installModel(
+      on,
+      () => translated('| 区域 | 说明 |\n|---|---|\n| 客户端 | 这是中文说明 |'),
+    )
+    const source =
+      '| Area | Notes |\n|---|---|\n| client | This is a long table cell with enough prose to translate. |'
+
+    const first = await $.ui.render(assistantInput(source))
+    expect(drawnText(first)).toContain('翻译中')
+
+    // 模型调用还没完成，引擎重绘同一条消息：不能闪回英文表。
+    const second = await $.ui.render(assistantInput(source))
+    expect(drawnText(second)).toContain('翻译中')
+    expect(drawnText(second)).not.toContain('Area')
+    expect(calls()).toBe(0)
+
+    await clock.advance(1)
+    await clock.settle()
+    expect(calls()).toBe(1)
+
+    const translatedView = await $.ui.render(assistantInput(source))
+    expect(drawnText(translatedView)).toContain('区域')
+    expect(drawnText(translatedView)).not.toContain('翻译中')
+  },
+)
+
+test(
   '首次绘制显示原文并由定时器启动翻译',
   { options: { translateOutput: true, outputLanguage: 'zh' } },
   async ($, on) => {
@@ -437,6 +494,63 @@ test(
 )
 
 test(
+  '长手输答案被模型截断时不采用短译文',
+  { options: { translateOutput: true, outputLanguage: 'zh', inputLanguage: 'en' } },
+  async ($, on) => {
+    const clock = mock.clock(on)
+    const longAnswer =
+      '我希望保留现有的接口兼容性，并且在不改变公开行为的前提下重构内部实现。'.repeat(30)
+
+    on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
+      return {
+        result: {
+          questions: e.questions,
+          answers: { '用哪个库？': `甲, ${longAnswer}` },
+        },
+      }
+    })
+
+    const prompts: string[] = []
+    on('model.complete', ($, e) => {
+      prompts.push(e.prompt)
+      if ((e.system ?? '').includes('answers a person typed')) {
+        return { value: answered('{"translations":["Short."]}') }
+      }
+      return {
+        value: answered(
+          '{"translations":["用哪个库？","库","甲","第一个选项。","乙","第二个选项。"]}',
+        ),
+      }
+    })
+
+    const questions = [
+      {
+        question: 'Which library?',
+        header: 'Library',
+        multiSelect: false,
+        options: [
+          { label: 'Alpha', description: 'First option.' },
+          { label: 'Beta', description: 'Second option.' },
+        ],
+      },
+    ]
+
+    const response = await $.tool.call({ tool: 'AskUserQuestion', questions })
+    const result = (response as { result: Record<string, unknown> }).result
+
+    expect(prompts.length).toBe(2)
+    expect(prompts[1]).toContain(longAnswer)
+    expect(result.answers).toEqual({
+      'Which library?': `Alpha, ${longAnswer}`,
+    })
+    expect(JSON.stringify(result)).not.toContain('Short.')
+
+    await clock.advance(1)
+    await clock.settle()
+  },
+)
+
+test(
   '手输答案翻译失败时保留原文',
   { options: { translateOutput: true, outputLanguage: 'zh', inputLanguage: 'en' } },
   async ($, on) => {
@@ -483,6 +597,130 @@ test(
 
     await clock.advance(1)
     await clock.settle()
+  },
+)
+
+test(
+  '关闭输入翻译时对话框答案只还原标签，不翻译手输文本',
+  {
+    options: {
+      translateInput: false,
+      translateOutput: true,
+      outputLanguage: 'zh',
+    },
+  },
+  async ($, on) => {
+    const clock = mock.clock(on)
+
+    on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
+      return {
+        result: {
+          questions: e.questions,
+          answers: { '用哪个库？': '甲, 我在 Windows 上开发' },
+          response: '能不能只用标准库？',
+        },
+      }
+    })
+
+    const calls = installModel(
+      on,
+      () =>
+        '{"translations":["用哪个库？","库","甲","第一个选项。","乙","第二个选项。"]}',
+    )
+
+    const questions = [
+      {
+        question: 'Which library?',
+        header: 'Library',
+        multiSelect: false,
+        options: [
+          { label: 'Alpha', description: 'First option.' },
+          { label: 'Beta', description: 'Second option.' },
+        ],
+      },
+    ]
+
+    const response = await $.tool.call({ tool: 'AskUserQuestion', questions })
+    const result = (response as { result: Record<string, unknown> }).result
+
+    expect(calls()).toBe(1)
+    expect(result.answers).toEqual({
+      'Which library?': 'Alpha, 我在 Windows 上开发',
+    })
+    expect(result.response).toBe('能不能只用标准库？')
+
+    await clock.advance(1)
+    await clock.settle()
+  },
+)
+
+test(
+  '关闭输出翻译但保留输入翻译时，手输答案仍翻成模型语言',
+  {
+    options: {
+      translateInput: true,
+      translateOutput: false,
+      inputLanguage: 'en',
+      outputLanguage: 'zh',
+    },
+  },
+  async ($, on) => {
+    let asked: Array<Record<string, unknown>> = []
+
+    on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
+      asked = e.questions as Array<Record<string, unknown>>
+      return {
+        result: {
+          questions: e.questions,
+          answers: { 'Which library?': 'Alpha, 我在 Windows 上开发' },
+          response: '能不能只用标准库？',
+        },
+      }
+    })
+
+    const prompts: string[] = []
+    on('model.complete', ($, e) => {
+      prompts.push(e.prompt)
+      const texts = JSON.parse(e.prompt) as string[]
+      return {
+        value: answered(
+          JSON.stringify({
+            translations: texts.map(text =>
+              text === '我在 Windows 上开发'
+                ? 'I develop on Windows'
+                : 'Can it use only the standard library?',
+            ),
+          }),
+        ),
+      }
+    })
+
+    const questions = [
+      {
+        question: 'Which library?',
+        header: 'Library',
+        multiSelect: false,
+        options: [
+          { label: 'Alpha', description: 'First option.' },
+          { label: 'Beta', description: 'Second option.' },
+        ],
+      },
+    ]
+
+    const response = await $.tool.call({ tool: 'AskUserQuestion', questions })
+    const result = (response as { result: Record<string, unknown> }).result
+
+    expect(prompts.length).toBe(1)
+    expect(JSON.parse(prompts[0]!)).toEqual([
+      '我在 Windows 上开发',
+      '能不能只用标准库？',
+    ])
+    expect(asked[0]?.question).toBe('Which library?')
+    expect(result.questions).toEqual(questions)
+    expect(result.answers).toEqual({
+      'Which library?': 'Alpha, I develop on Windows',
+    })
+    expect(result.response).toBe('Can it use only the standard library?')
   },
 )
 
@@ -573,6 +811,38 @@ test(
 )
 
 test(
+  'goal 提示行拆成多个 text block 时原样通过',
+  { options: { translateInput: true, inputLanguage: 'en' } },
+  async ($, on) => {
+    const calls = installModel(on, () => translated('Fix the login problem'))
+    const ack =
+      'A session-scoped Stop hook is now active with condition: "修好登录问题". Briefly acknowledge the goal.'
+    const session = mock.session(on)
+
+    await $.session.append({
+      message: {
+        type: 'user',
+        role: 'user',
+        isMeta: true,
+        content: [
+          { type: 'text', text: ack },
+          { type: 'text', text: 'extra' },
+        ],
+      },
+      door: 'note',
+      origin: { kind: 'engine' },
+      uuid: 'n4',
+    })
+
+    expect(calls()).toBe(0)
+    expect(session.appended().at(-1)?.message.content).toEqual([
+      { type: 'text', text: ack },
+      { type: 'text', text: 'extra' },
+    ])
+  },
+)
+
+test(
   '其他命令的输出行不改写',
   { options: { translateOutput: true, outputLanguage: 'zh' } },
   async ($, on) => {
@@ -630,8 +900,9 @@ test(
       outputLanguage: 'zh',
       model: 'haiku',
       translationRules: '',
+      promptVersion: PROMPT_TAG,
     })
-    const key = cacheKey(signature, 'zh', source)
+    const key = cacheKey(signature, 'zh', 'output', source)
 
     mock.store(on, {
       cache: { [key]: { status: 'translated', text: '这是助手的回复。' } },
@@ -811,3 +1082,196 @@ test(
     expect(reply.text).toContain('outputLanguage=zh')
   },
 )
+
+test(
+  'translator reset 回到注册时的插件选项',
+  { options: { outputLanguage: 'ja', model: 'sonnet' } },
+  async ($, on) => {
+    mock.store(on)
+
+    const changed = await $.command.run({
+      command: 'translator',
+      args: 'output en',
+    })
+    expect(changed.text).toContain('outputLanguage=en')
+
+    const reset = await $.command.run({
+      command: 'translator',
+      args: 'reset',
+    })
+    expect(reset.text).toContain('outputLanguage=ja')
+    expect(reset.text).toContain('model=sonnet')
+
+    const status = await $.command.run({
+      command: 'translator',
+      args: 'status',
+    })
+    expect(status.text).toContain('outputLanguage=ja')
+    expect(status.text).toContain('model=sonnet')
+  },
+)
+
+test(
+  '持久化缓存里的失败条目不再让原文永久停在原文',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    const clock = mock.clock(on)
+    const source = 'This is the assistant reply.'
+    const signature = translationSignature({
+      inputLanguage: 'en',
+      outputLanguage: 'zh',
+      model: 'haiku',
+      translationRules: '',
+      promptVersion: PROMPT_TAG,
+    })
+    const key = cacheKey(signature, 'zh', 'output', source)
+
+    mock.store(on, {
+      cache: { [key]: { status: 'failed', reason: 'malformed-response: x' } },
+    })
+    registerRenderBottoms(on)
+    const calls = installModel(on, () => translated('这是助手的回复。'))
+
+    await $.ui.render(assistantInput(source))
+    await clock.advance(1)
+    await clock.settle()
+
+    const second = await $.ui.render(assistantInput(source))
+    expect(drawnText(second)).toBe('这是助手的回复。')
+    expect(calls()).toBe(1)
+  },
+)
+
+test(
+  '新会话从 store 恢复保存的设置',
+  { options: { model: 'haiku', inputLanguage: 'en', outputLanguage: 'zh' } },
+  async ($, on) => {
+    mock.store(on, {
+      settings: {
+        translateInput: false,
+        inputLanguage: 'ja',
+        translateOutput: true,
+        outputLanguage: 'en',
+        model: 'sonnet',
+        translationRules: '- 保留术语',
+      },
+    })
+    on('session.start', ($inner, e) => e)
+    await $.session.start({ cwd: '.' })
+
+    const reply = await $.command.run({
+      command: 'translator',
+      args: 'status',
+    })
+
+    expect(reply.text).toContain('translateInput=false')
+    expect(reply.text).toContain('inputLanguage=ja')
+    expect(reply.text).toContain('translateOutput=true')
+    expect(reply.text).toContain('outputLanguage=en')
+    expect(reply.text).toContain('model=sonnet')
+    expect(reply.text).toContain('translationRules=- 保留术语')
+  },
+)
+
+test(
+  '存储设置里的非法值回退到注册选项',
+  { options: { model: 'haiku', inputLanguage: 'en', outputLanguage: 'zh' } },
+  async ($, on) => {
+    mock.store(on, {
+      settings: {
+        outputLanguage: 'xx',
+        model: 123,
+        translationRules: null,
+        translateInput: 'yes',
+      },
+    })
+    on('session.start', ($inner, e) => e)
+    await $.session.start({ cwd: '.' })
+
+    const reply = await $.command.run({
+      command: 'translator',
+      args: 'status',
+    })
+
+    expect(reply.text).toContain('translateInput=true')
+    expect(reply.text).toContain('inputLanguage=en')
+    expect(reply.text).toContain('outputLanguage=zh')
+    expect(reply.text).toContain('model=haiku')
+    expect(reply.text).toContain('translationRules=(empty)')
+    expect(reply.text).not.toContain('outputLanguage=xx')
+    expect(reply.text).not.toContain('model=123')
+  },
+)
+
+test(
+  '存储设置只提供部分字段时其余字段沿用注册选项',
+  { options: { outputLanguage: 'fr' } },
+  async ($, on) => {
+    mock.store(on, { settings: { inputLanguage: 'ja' } })
+    on('session.start', ($inner, e) => e)
+    await $.session.start({ cwd: '.' })
+
+    const reply = await $.command.run({
+      command: 'translator',
+      args: 'status',
+    })
+
+    expect(reply.text).toContain('inputLanguage=ja')
+    expect(reply.text).toContain('outputLanguage=fr')
+    expect(reply.text).not.toContain('outputLanguage=zh')
+  },
+)
+
+test('时钟缺失或抛错时清掉 pending，下一次还能重试', {}, async () => {
+  const key = 'schedule-failure-retry'
+  let started = 0
+  const start = () => {
+    started += 1
+  }
+  const missing:
+    | { after(delay: number, callback: () => void): unknown }
+    | undefined = undefined
+
+  expect(
+    scheduleTranslation(callback => missing!.after(1, callback), key, start),
+  ).toBe('failed')
+  expect(
+    scheduleTranslation(
+      () => {
+        throw new Error('clock-unavailable')
+      },
+      key,
+      start,
+    ),
+  ).toBe('failed')
+
+  const queued: Array<() => void> = []
+  expect(
+    scheduleTranslation(
+      callback => {
+        queued.push(callback)
+      },
+      key,
+      start,
+    ),
+  ).toBe('scheduled')
+  expect(started).toBe(0)
+  queued[0]!()
+  expect(started).toBe(1)
+})
+
+test('同一 key 已调度时返回 busy，不重复启动', {}, async () => {
+  const key = 'schedule-busy-dedup'
+  let started = 0
+  const start = () => {
+    started += 1
+  }
+  const clock = (callback: () => void) => {
+    callback()
+  }
+
+  expect(scheduleTranslation(clock, key, start)).toBe('scheduled')
+  expect(started).toBe(1)
+  expect(scheduleTranslation(clock, key, start)).toBe('busy')
+  expect(started).toBe(1)
+})

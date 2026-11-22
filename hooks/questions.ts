@@ -13,6 +13,11 @@ function isTranslatable(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0
 }
 
+// 引擎的 annotation 值是对象；只有 notes 是用户手输的自由文本。
+function annotationNotes(value: Record): string | undefined {
+  return isTranslatable(value.notes) ? value.notes : undefined
+}
+
 function questionFields(question: Record): readonly unknown[] {
   return [
     question.question,
@@ -214,9 +219,17 @@ function questionTextOf(question: unknown): string | undefined {
 function answerMaps(
   original: readonly unknown[],
   translated: readonly unknown[],
-): { questions: Map<string, string>; labels: Map<string, string> } {
+): {
+  questions: Map<string, string>
+  labels: Map<string, string>
+  labelsByQuestion: Map<string, Map<string, string>>
+} {
   const questions = new Map<string, string>()
   const labels = new Map<string, string>()
+  const labelsByQuestion = new Map<string, Map<string, string>>()
+  // 合并映射只给无问题归属的 response 用。同一译名在不同问题指向不同原文时
+  // 无法判断它属于哪道题，移除它，让 response 按自由文本处理。
+  const ambiguousLabels = new Set<string>()
 
   const count = Math.min(original.length, translated.length)
   for (let index = 0; index < count; index += 1) {
@@ -233,17 +246,30 @@ function answerMaps(
     const sourceOptions = Array.isArray(source.options) ? source.options : []
     const drawnOptions = Array.isArray(drawn.options) ? drawn.options : []
     const options = Math.min(sourceOptions.length, drawnOptions.length)
+    const questionLabels = new Map<string, string>()
     for (let option = 0; option < options; option += 1) {
       const a = sourceOptions[option]
       const b = drawnOptions[option]
       if (!isRecord(a) || !isRecord(b)) continue
       if (isTranslatable(a.label) && isTranslatable(b.label)) {
-        labels.set(b.label, a.label)
+        questionLabels.set(b.label, a.label)
+        if (!ambiguousLabels.has(b.label)) {
+          const existing = labels.get(b.label)
+          if (existing === undefined || existing === a.label) {
+            labels.set(b.label, a.label)
+          } else {
+            labels.delete(b.label)
+            ambiguousLabels.add(b.label)
+          }
+        }
       }
+    }
+    if (sourceText !== undefined) {
+      labelsByQuestion.set(sourceText, questionLabels)
     }
   }
 
-  return { questions, labels }
+  return { questions, labels, labelsByQuestion }
 }
 
 function answerParts(value: unknown): string[] {
@@ -304,8 +330,17 @@ export function freeTextAnswers(
   const maps = answerMaps(original, translated)
   const texts: string[] = []
 
-  const push = (value: unknown): void => {
-    for (const segment of splitAnswer(value, maps.labels)) {
+  // 答案按所属问题取标签映射；同一译名在两道题出现时不会互相覆盖。
+  const labelsFor = (key: string): ReadonlyMap<string, string> => {
+    const originalQuestion = maps.questions.get(key) ?? key
+    return maps.labelsByQuestion.get(originalQuestion) ?? maps.labels
+  }
+
+  const push = (
+    value: unknown,
+    labels: ReadonlyMap<string, string>,
+  ): void => {
+    for (const segment of splitAnswer(value, labels)) {
       if (segment.kind !== 'free') continue
       if (texts.includes(segment.text)) continue
       texts.push(segment.text)
@@ -313,12 +348,22 @@ export function freeTextAnswers(
   }
 
   if (isRecord(result.answers)) {
-    for (const value of Object.values(result.answers)) push(value)
+    for (const [key, value] of Object.entries(result.answers)) {
+      push(value, labelsFor(key))
+    }
   }
   if (isRecord(result.annotations)) {
-    for (const value of Object.values(result.annotations)) push(value)
+    for (const [key, value] of Object.entries(result.annotations)) {
+      const labels = labelsFor(key)
+      if (!isRecord(value)) {
+        push(value, labels)
+        continue
+      }
+      const notes = annotationNotes(value)
+      if (notes !== undefined) push(notes, labels)
+    }
   }
-  push(result.response)
+  push(result.response, maps.labels)
 
   return texts
 }
@@ -337,8 +382,16 @@ export function translateAnswers(
 
   const maps = answerMaps(original, translated)
 
-  const restoreValue = (value: unknown): unknown => {
-    return splitAnswer(value, maps.labels)
+  const labelsFor = (key: string): ReadonlyMap<string, string> => {
+    const originalQuestion = maps.questions.get(key) ?? key
+    return maps.labelsByQuestion.get(originalQuestion) ?? maps.labels
+  }
+
+  const restoreValue = (
+    value: unknown,
+    labels: ReadonlyMap<string, string>,
+  ): unknown => {
+    return splitAnswer(value, labels)
       .map(segment =>
         segment.kind === 'label'
           ? segment.text
@@ -354,22 +407,35 @@ export function translateAnswers(
     out.answers = Object.fromEntries(
       Object.entries(result.answers).map(([key, value]) => [
         maps.questions.get(key) ?? key,
-        restoreValue(value),
+        restoreValue(value, labelsFor(key)),
       ]),
     )
   }
 
   if (isRecord(result.annotations)) {
+    // 引擎的 annotation 值是对象：只翻 notes，preview 和 unanswered 原样保留。
+    const restoreAnnotation = (
+      value: unknown,
+      labels: ReadonlyMap<string, string>,
+    ): unknown => {
+      if (typeof value === 'string') return restoreValue(value, labels)
+      if (!isRecord(value)) return value
+      const notes = annotationNotes(value)
+      return notes === undefined
+        ? { ...value }
+        : { ...value, notes: restoreValue(notes, labels) }
+    }
+
     out.annotations = Object.fromEntries(
       Object.entries(result.annotations).map(([key, value]) => [
         maps.questions.get(key) ?? key,
-        restoreValue(value),
+        restoreAnnotation(value, labelsFor(key)),
       ]),
     )
   }
 
   if (typeof result.response === 'string') {
-    out.response = restoreValue(result.response)
+    out.response = restoreValue(result.response, maps.labels)
   }
 
   return out

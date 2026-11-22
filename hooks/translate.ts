@@ -41,7 +41,10 @@ export type SignatureInput = {
   readonly outputLanguage: TranslationLanguage
   readonly model: string
   readonly translationRules: string
+  readonly promptVersion: string
 }
+
+export type CacheKeyKind = TranslationKind | 'questions'
 
 export type TranslateOptions = {
   readonly text: string
@@ -49,7 +52,6 @@ export type TranslateOptions = {
   readonly translationRules: string
   readonly model: string
   readonly kind: TranslationKind
-  readonly signal?: AbortSignal
 }
 
 function fnv1a(text: string): string {
@@ -68,6 +70,7 @@ export function translationSignature(input: SignatureInput): string {
       input.outputLanguage,
       input.model,
       input.translationRules,
+      input.promptVersion,
     ].join('\u0000'),
   )
 }
@@ -75,9 +78,10 @@ export function translationSignature(input: SignatureInput): string {
 export function cacheKey(
   signature: string,
   target: TranslationLanguage,
+  kind: CacheKeyKind,
   text: string,
 ): string {
-  return `${signature}:${target}:${fnv1a(text)}`
+  return `${signature}:${target}:${kind}:${fnv1a(text)}`
 }
 
 function isCacheEntry(value: unknown): value is TranslationCacheEntry {
@@ -123,19 +127,32 @@ export function pruneCache(cache: TranslationCache): TranslationCache {
   return kept
 }
 
+// 只把成功译文写进持久化缓存。失败条目留在内存里，下次会话会重试；
+// 否则一次格式错误的回复会让这条原文永久停在原文。
+export function persistableCache(cache: TranslationCache): TranslationCache {
+  const kept: TranslationCache = {}
+  for (const [key, entry] of Object.entries(cache)) {
+    if (entry.status === 'translated') kept[key] = entry
+  }
+  return kept
+}
+
+// 只把 /命令 当命令跳过；/var/... 这类路径开头的正文照常翻译。
+const SLASH_COMMAND = /^\/[A-Za-z][\w-]*(?:\s|$)/
+
 export function shouldTranslate(
   text: string,
   target: TranslationLanguage,
   translationRules: string,
 ): boolean {
   if (text.trim().length === 0) return false
-  if (text.trimStart().startsWith('/')) return false
+  if (SLASH_COMMAND.test(text.trimStart())) return false
 
   const protectedText = protectText(text)
   if (!hasTranslatableProse(protectedText.text)) return false
 
   const hasRules = translationRules.trim().length > 0
-  if (!hasRules && detectSourceLanguage(text, target) === target) return false
+  if (!hasRules && detectSourceLanguage(text) === target) return false
 
   return true
 }

@@ -8,7 +8,7 @@ export type TranslationRequest = {
   readonly prompt: string
 }
 
-const PROMPT_TAG = 'CLAUDE_CODE_SESSION_TRANSLATION_V1'
+export const PROMPT_TAG = 'CLAUDE_CODE_SESSION_TRANSLATION_V1'
 
 function ruleLines(rules: string): string[] {
   return rules
@@ -58,10 +58,17 @@ export function buildTranslationRequest(input: {
   return { system, prompt }
 }
 
+// 模型偶尔无视"不要代码围栏"的指令。围栏只是包装，去掉再解析。
+function stripCodeFence(response: string): string {
+  const trimmed = response.trim()
+  const fenced = /^```[a-zA-Z0-9_-]*\s*\n?([\s\S]*?)\n?```$/.exec(trimmed)
+  return fenced?.[1]?.trim() ?? trimmed
+}
+
 export function parseTranslationResponse(response: string): string | undefined {
   let parsed: unknown
   try {
-    parsed = JSON.parse(response)
+    parsed = JSON.parse(stripCodeFence(response))
   } catch {
     return undefined
   }
@@ -70,9 +77,7 @@ export function parseTranslationResponse(response: string): string | undefined {
     return undefined
   }
 
-  const keys = Object.keys(parsed)
-  if (keys.length !== 1 || keys[0] !== 'translation') return undefined
-
+  // 多出的字段不影响译文；缺 translation 或类型不对才算失败。
   const value = (parsed as Record<string, unknown>).translation
   return typeof value === 'string' ? value : undefined
 }

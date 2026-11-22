@@ -34,6 +34,26 @@ const HAN = /^\p{Script=Han}$/u
 const LATIN = /^\p{Script=Latin}$/u
 const PLACEHOLDER = /@@JXZ_TRANSLATION_\d+@@/g
 
+const LATIN_ACCENT = /[\u00C0-\u024F\u1E00-\u1EFF]/
+const LATIN_WORD = /[\p{Script=Latin}]+/gu
+
+// 法语和德语的常用虚词。命中一个就说明不是英语，宁可多翻一次也不漏翻。
+const NON_ENGLISH_MARKERS: ReadonlySet<string> = new Set([
+  'le', 'la', 'les', 'du', 'et', 'est', 'pas', 'pour', 'dans', 'avec',
+  'sur', 'que', 'qui', 'je', 'tu', 'nous', 'vous', 'aux', 'une',
+  'der', 'die', 'das', 'den', 'dem', 'des', 'und', 'ist', 'nicht',
+  'mit', 'für', 'von', 'zu', 'ein', 'eine', 'ich', 'wir', 'sie',
+  'auf', 'auch',
+])
+
+function hasNonEnglishSignal(text: string): boolean {
+  if (LATIN_ACCENT.test(text)) return true
+  for (const word of text.toLowerCase().match(LATIN_WORD) ?? []) {
+    if (NON_ENGLISH_MARKERS.has(word)) return true
+  }
+  return false
+}
+
 function countScript(text: string, pattern: RegExp): number {
   let count = 0
   for (const char of text) {
@@ -42,10 +62,10 @@ function countScript(text: string, pattern: RegExp): number {
   return count
 }
 
-// 目标语言不参与识别：这里只回答源文本是什么语言。
+// 目标语言不参与识别：这里只回答源文本是什么语言。判断不出时返回 undefined，
+// 调用方据此选择翻译而不是跳过。拉丁字母不等于英语，法语和德语要先排除。
 export function detectSourceLanguage(
   text: string,
-  _target: TranslationLanguage,
 ): TranslationLanguage | undefined {
   let kana = 0
   let han = 0
@@ -59,7 +79,9 @@ export function detectSourceLanguage(
 
   if (kana > 0) return 'ja'
   if (han > 0 && han >= latin) return 'zh'
-  if (latin > 0 && han === 0) return 'en'
+  if (latin > 0 && han === 0) {
+    return hasNonEnglishSignal(text) ? undefined : 'en'
+  }
   return undefined
 }
 
