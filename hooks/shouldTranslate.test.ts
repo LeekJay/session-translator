@@ -49,6 +49,22 @@ test('斜杠命令不翻译', {}, async () => {
   expect(shouldTranslate('/goal 修好登录问题', 'en', '')).toBe(false)
 })
 
+test('带命名空间的斜杠命令不翻译', {}, async () => {
+  expect(
+    shouldTranslate('/pstack:poteto-mode 目前 #345 还有哪些没完成?', 'en', ''),
+  ).toBe(false)
+})
+
+test('冒号连写的命令名也按命令跳过', {}, async () => {
+  expect(shouldTranslate('/foo:bar:baz', 'en', '')).toBe(false)
+})
+
+test('冒号出现在路径里时照常翻译', {}, async () => {
+  expect(
+    shouldTranslate('/var/log:2026/app.log 报错了，帮我看看', 'en', ''),
+  ).toBe(true)
+})
+
 test('以绝对路径开头的提示照常翻译', {}, async () => {
   expect(
     shouldTranslate('/var/log/app.log 报错了，帮我看看', 'en', ''),
