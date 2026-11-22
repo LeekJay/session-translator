@@ -1,7 +1,7 @@
 {
   "name": "session-translator",
   "version": "0.1.0",
-  "description": "把提示替换成模型语言的译文后提交，把回复翻译成你的语言；输入原文本机保存、查看时还原。",
+  "description": "把提示替换成模型语言的译文后提交，把回复翻译成你的语言；输入记录和显示都是译文，原文保存在本机插件存储。",
   "author": { "name": "LeekJay" },
   "license": "MIT",
   "types": "./types/index.d.ts",
