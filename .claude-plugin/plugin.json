@@ -1,7 +1,7 @@
 {
   "name": "session-translator",
   "version": "0.1.0",
-  "description": "把提示翻译成模型语言，把回复翻译成你的语言；提示和回复原文不改，/goal 写给模型的提示行会存译文。",
+  "description": "把提示替换成模型语言的译文后提交，把回复翻译成你的语言；输入原文本机保存、查看时还原。",
   "author": { "name": "LeekJay" },
   "license": "MIT",
   "types": "./types/index.d.ts",
@@ -9,7 +9,7 @@
     "translateInput": {
       "type": "boolean",
       "title": "翻译提示",
-      "description": "提交前把你写的内容翻译成模型语言。",
+      "description": "提交前把你写的内容替换成模型语言的译文。",
       "default": true
     },
     "inputLanguage": {

@@ -77,12 +77,27 @@ function assistantInput(text: string): RenderInput<'AssistantMessage'> {
 function userMessageInput(
   text: string,
   origin: PromptOrigin,
+  messageId = 'u1',
 ): RenderInput<'UserMessage'> {
   return {
     surface: 'terminal',
     component: 'UserMessage',
-    requestId: 'u1',
+    requestId: messageId,
     props: { text, origin, isExpanded: false },
+  }
+}
+
+function appendedUserMessage(text: string, messageId: string) {
+  return {
+    message: {
+      type: 'user',
+      role: 'user',
+      isMeta: false,
+      content: [{ type: 'text', text }],
+    },
+    door: 'user',
+    origin: { kind: 'composer' },
+    uuid: messageId,
   }
 }
 
@@ -112,9 +127,10 @@ function drawnText(node: unknown): string {
 }
 
 test(
-  '中文提示原样进入并附带英文译文上下文',
+  '中文提示被替换成译文提交，查看时按消息 ID 显示原文',
   { options: { translateInput: true, inputLanguage: 'en' } },
   async ($, on) => {
+    registerRenderBottoms(on)
     let reached = ''
     let context: readonly string[] | undefined
     const calls = installModel(on, () => translated('Hello from the test'))
@@ -129,20 +145,34 @@ test(
       wait: false,
       origin: { kind: 'composer' },
     })
+    await $.session.append(
+      appendedUserMessage('Hello from the test', 'm-input-1') as never,
+    )
 
     expect(calls()).toBe(1)
-    expect(reached).toBe('请帮我看看这个文件')
-    expect(context?.join('\n')).toContain('Hello from the test')
+    expect(reached).toBe('Hello from the test')
+    expect(context).toBeUndefined()
+
+    const drawn = await $.ui.render(
+      userMessageInput(
+        'Hello from the test',
+        { kind: 'composer' },
+        'm-input-1',
+      ),
+    )
+    expect(drawnText(drawn)).toBe('请帮我看看这个文件')
   },
 )
 
 test(
-  '输入语言不是英语时 context 标签跟随模型语言',
+  '输入语言是日语时提交的是日语译文',
   { options: { translateInput: true, inputLanguage: 'ja' } },
   async ($, on) => {
+    let reached = ''
     let context: readonly string[] | undefined
     const calls = installModel(on, () => translated('これはテストです'))
     on('prompt.submit', ($, e) => {
+      reached = e.text
       context = e.context
       return { text: e.text }
     })
@@ -154,39 +184,183 @@ test(
     })
 
     expect(calls()).toBe(1)
-    expect(context?.join('\n')).toContain('Japanese translation')
-    expect(context?.join('\n')).not.toContain('English translation')
+    expect(reached).toBe('これはテストです')
+    expect(context).toBeUndefined()
   },
 )
 
 test(
-  '用户行显示原始中文提示',
+  '用户行按消息 ID 显示原始中文提示',
   { options: { translateInput: true, inputLanguage: 'en' } },
   async ($, on) => {
     registerRenderBottoms(on)
-    let reached = ''
     installModel(on, () => translated('Hello from the test'))
-    on('prompt.submit', ($, e) => {
-      reached = e.text
-      return { text: e.text }
-    })
+    on('prompt.submit', ($, e) => ({ text: e.text }))
 
     await $.prompt.submit({
       text: '请帮我看看这个文件',
       wait: false,
       origin: { kind: 'composer' },
     })
-    expect(reached).toBe('请帮我看看这个文件')
-
-    const composer = await $.ui.render(
-      userMessageInput('请帮我看看这个文件', { kind: 'composer' }),
+    await $.session.append(
+      appendedUserMessage('Hello from the test', 'm-user-1') as never,
     )
-    expect(drawnText(composer)).toBe('请帮我看看这个文件')
+
+    const translatedRow = await $.ui.render(
+      userMessageInput(
+        'Hello from the test',
+        { kind: 'composer' },
+        'm-user-1',
+      ),
+    )
+    expect(drawnText(translatedRow)).toBe('请帮我看看这个文件')
 
     const notification = await $.ui.render(
       userMessageInput('请帮我看看这个文件', { kind: 'task-notification' }),
     )
     expect(drawnText(notification)).toBe('请帮我看看这个文件')
+  },
+)
+
+test(
+  '两条不同原文译成同一文本时各显示自己的原文',
+  { options: { translateInput: true, inputLanguage: 'en' } },
+  async ($, on) => {
+    registerRenderBottoms(on)
+    installModel(on, () => translated('OK'))
+    on('prompt.submit', ($, e) => ({ text: e.text }))
+
+    await $.prompt.submit({
+      text: '好的',
+      wait: false,
+      origin: { kind: 'composer' },
+    })
+    await $.session.append(appendedUserMessage('OK', 'm-ok-1') as never)
+
+    await $.prompt.submit({
+      text: '可以',
+      wait: false,
+      origin: { kind: 'composer' },
+    })
+    await $.session.append(appendedUserMessage('OK', 'm-ok-2') as never)
+
+    const first = await $.ui.render(
+      userMessageInput('OK', { kind: 'composer' }, 'm-ok-1'),
+    )
+    const second = await $.ui.render(
+      userMessageInput('OK', { kind: 'composer' }, 'm-ok-2'),
+    )
+    expect(drawnText(first)).toBe('好的')
+    expect(drawnText(second)).toBe('可以')
+  },
+)
+
+test(
+  '新会话从 store 恢复原文映射',
+  { options: { translateInput: true, inputLanguage: 'en' } },
+  async ($, on) => {
+    registerRenderBottoms(on)
+    mock.store(on, { originals: { 'm-old': '旧的原文' } })
+
+    const drawn = await $.ui.render(
+      userMessageInput('OK', { kind: 'composer' }, 'm-old'),
+    )
+    expect(drawnText(drawn)).toBe('旧的原文')
+  },
+)
+
+test(
+  '输入翻译瞬时失败会重试一次再替换',
+  { options: { translateInput: true, inputLanguage: 'en' } },
+  async ($, on) => {
+    let calls = 0
+    on('model.complete', () => {
+      calls += 1
+      if (calls === 1) {
+        return {
+          value: {
+            isAnswered: false as const,
+            reason: 'api-error' as const,
+            status: 529,
+            error: 'overloaded' as const,
+            usage: USAGE,
+          },
+        }
+      }
+      return { value: answered(translated('Hello again')) }
+    })
+
+    let reached = ''
+    on('prompt.submit', ($, e) => {
+      reached = e.text
+      return { text: e.text }
+    })
+
+    await $.prompt.submit({
+      text: '再看看',
+      wait: false,
+      origin: { kind: 'composer' },
+    })
+
+    expect(calls).toBe(2)
+    expect(reached).toBe('Hello again')
+  },
+)
+
+test(
+  '连续提交时排队的原文都按顺序绑定',
+  { options: { translateInput: true, inputLanguage: 'en' } },
+  async ($, on) => {
+    registerRenderBottoms(on)
+    installModel(on, () => translated('OK'))
+    on('prompt.submit', ($, e) => ({ text: e.text }))
+
+    // 两条都还没落库就先提交下一条；清空队列会丢掉第一条的原文映射。
+    await $.prompt.submit({
+      text: '第一条',
+      wait: false,
+      origin: { kind: 'composer' },
+    })
+    await $.prompt.submit({
+      text: '第二条',
+      wait: false,
+      origin: { kind: 'composer' },
+    })
+
+    await $.session.append(appendedUserMessage('OK', 'm-q1') as never)
+    await $.session.append(appendedUserMessage('OK', 'm-q2') as never)
+
+    const first = await $.ui.render(
+      userMessageInput('OK', { kind: 'composer' }, 'm-q1'),
+    )
+    const second = await $.ui.render(
+      userMessageInput('OK', { kind: 'composer' }, 'm-q2'),
+    )
+    expect(drawnText(first)).toBe('第一条')
+    expect(drawnText(second)).toBe('第二条')
+  },
+)
+
+test(
+  '输入翻译失败时丢弃提交，模型收不到原文',
+  { options: { translateInput: true, inputLanguage: 'en' } },
+  async ($, on) => {
+    installModel(on, () => 'not json')
+    let reached = ''
+    on('prompt.submit', ($, e) => {
+      reached = e.text
+      return { text: e.text }
+    })
+
+    const answer = (await $.prompt.submit({
+      text: '请修好登录',
+      wait: false,
+      origin: { kind: 'composer' },
+    })) as { drop?: string; text?: string }
+
+    expect(reached).toBe('')
+    expect(answer.text).toBeUndefined()
+    expect(answer.drop).toContain('翻译失败')
   },
 )
 

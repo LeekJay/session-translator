@@ -7,6 +7,7 @@ import type {
   RenderElement,
 } from 'claude-code'
 import type {
+  OriginalPrompts,
   TranslationCache,
   TranslationCacheEntry,
   TranslationLanguage,
@@ -60,7 +61,23 @@ const cache = atom(
   {},
 )
 
+const originals = atom(
+  { plugin: 'session-translator', key: 'originals' } as const,
+  {},
+)
+
 const pending = new Set<string>()
+
+type PendingInput = {
+  readonly translated: string
+  readonly original: string
+}
+
+// prompt.submit 拿不到消息 ID；session.append 才带 uuid。提交时先记下译文与原文，
+// 落库时按文本匹配并绑定到消息 ID，查看时再按消息 ID 找回原文。
+// 排队提交时可能有多条同时等待落库，按先后顺序匹配；上限防止异常情况无限增长。
+const pendingInputs: PendingInput[] = []
+const MAX_PENDING_INPUTS = 16
 
 export type ScheduleResult = 'scheduled' | 'busy' | 'failed'
 
@@ -128,6 +145,64 @@ function schedulePersist($: EngineInterface): void {
     })
   } catch {
     persistScheduled = false
+  }
+}
+
+const ORIGINALS_STORE_KEY = 'originals'
+const MAX_ORIGINAL_PROMPTS = 2000
+
+function isOriginalPrompts(value: unknown): value is OriginalPrompts {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false
+  }
+  return Object.values(value as Record<string, unknown>).every(
+    entry => typeof entry === 'string',
+  )
+}
+
+function pruneOriginals(map: OriginalPrompts): OriginalPrompts {
+  const keys = Object.keys(map)
+  if (keys.length <= MAX_ORIGINAL_PROMPTS) return map
+
+  const kept: OriginalPrompts = {}
+  for (const key of keys.slice(keys.length - MAX_ORIGINAL_PROMPTS)) {
+    const value = map[key]
+    if (value !== undefined) kept[key] = value
+  }
+  return kept
+}
+
+let persistedOriginals: OriginalPrompts | undefined
+
+async function readPersistedOriginals(
+  $: EngineInterface,
+): Promise<OriginalPrompts> {
+  if (persistedOriginals !== undefined) return persistedOriginals
+
+  try {
+    const saved = await $.store.get(ORIGINALS_STORE_KEY)
+    if (isOriginalPrompts(saved)) {
+      persistedOriginals = pruneOriginals(saved)
+      return persistedOriginals
+    }
+  } catch {
+    // store 不可用时只影响 --resume 后的原文显示，当前会话仍用 $.state。
+  }
+  return {}
+}
+
+async function persistOriginals($: EngineInterface): Promise<void> {
+  try {
+    const entries = await read($, originals)
+    const merged = pruneOriginals({
+      ...(persistedOriginals ?? {}),
+      ...entries,
+    })
+    persistedOriginals = merged
+    await $.store.set(ORIGINALS_STORE_KEY, merged)
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : 'unknown-error'
+    safeLog($, `原文映射持久化失败：${reason}`)
   }
 }
 
@@ -553,6 +628,17 @@ export const register: Register = (on, options) => {
     }
 
     try {
+      const savedOriginals = await readPersistedOriginals($)
+      if (Object.keys(savedOriginals).length > 0) {
+        await update($, originals, current =>
+          pruneOriginals({ ...savedOriginals, ...current }),
+        )
+      }
+    } catch {
+      // 读取失败只影响 --resume 后的原文显示。
+    }
+
+    try {
       await $.command.register({
         name: 'translator-test',
         description:
@@ -722,30 +808,35 @@ export const register: Register = (on, options) => {
 
     safeStatus($, '翻译中…')
     try {
-      const entry = await translate($, {
+      const request: TranslateOptions = {
         text: e.text,
         target: runtime.config.inputLanguage,
         translationRules: runtime.config.translationRules,
         model: runtime.config.model,
         kind: 'input',
-      })
-
-      if (entry.status !== 'translated') {
-        safeLog($, `提示翻译失败：${entry.reason}`)
-        return next(e)
+      }
+      let entry = await translate($, request)
+      // 输入翻译失败会把原文交给主模型，违背替换模式；瞬时失败再试一次。
+      if (entry.status !== 'translated' && isTransientFailure(entry.reason)) {
+        entry = await translate($, request)
       }
 
-      return next({
-        ...e,
-        context: [
-          ...(e.context ?? []),
-          `${languageName(runtime.config.inputLanguage)} translation of the user's message above:\n${entry.text}`,
-        ],
-      })
+      if (entry.status !== 'translated') {
+        // 回退原文会把它交给主模型，违背替换模式；丢弃提交，引擎会把原文放回输入框。
+        safeLog($, `提示翻译失败，已丢弃提交：${entry.reason}`)
+        return { drop: `提示翻译失败，原文已放回输入框：${entry.reason}` }
+      }
+
+      pendingInputs.push({ translated: entry.text, original: e.text })
+      if (pendingInputs.length > MAX_PENDING_INPUTS) pendingInputs.shift()
+      return next({ ...e, text: entry.text })
     } finally {
       safeStatus($, undefined)
     }
-  }).catch(($, e, next) => next(e))
+  }).catch(($, e, next) => {
+    safeLog($, '提示翻译异常，已丢弃提交')
+    return { drop: '提示翻译异常，原文已放回输入框' }
+  })
 
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
     let rewritten: string | undefined
@@ -801,6 +892,25 @@ export const register: Register = (on, options) => {
     return rewritten === undefined
       ? next(e)
       : next({ ...e, props: { ...e.props, text: rewritten } })
+  })
+
+  // 输入翻译把用户消息替换成了译文，记录和模型历史都是译文。
+  // 引擎把 UserMessage 的 requestId 设为消息 ID，和 session.append 的 uuid 一致；
+  // 查看时按它把原文换回来。直接读会话文件的工具仍会看到译文。
+  on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
+    try {
+      const messageId = e.requestId
+      if (typeof messageId !== 'string') return next(e)
+
+      const map = await read($, originals)
+      const original =
+        map[messageId] ?? (await readPersistedOriginals($))[messageId]
+      if (original === undefined) return next(e)
+
+      return next({ ...e, props: { ...e.props, text: original } })
+    } catch {
+      return next(e)
+    }
   })
 
   // 选择对话框由引擎直接画工具入参。在 tool.call 阶段改写入参，引擎校验的
@@ -972,5 +1082,37 @@ export const register: Register = (on, options) => {
     } catch {
       return next(e)
     }
+  }).catch(($, e, next) => next(e))
+
+  // 用户消息落库时才能拿到消息 ID。把提交时暂存的原文按译文匹配，
+  // 再绑定到这条消息的 uuid；查看时按同一个 ID 显示原文。
+  on('session.append', async ($, e, next) => {
+    try {
+      const originKind = e.origin?.kind ?? 'unclassified'
+      if (!TRANSLATABLE_ORIGINS.has(originKind)) return next(e)
+
+      const messageId = e.uuid
+      if (typeof messageId !== 'string' || messageId.length === 0) {
+        return next(e)
+      }
+      const text = contentText(e.message.content)
+      if (text === undefined) return next(e)
+
+      const index = pendingInputs.findIndex(
+        item => item.translated.trim() === text.trim(),
+      )
+      if (index === -1) return next(e)
+
+      const item = pendingInputs.splice(index, 1)[0]
+      if (item === undefined) return next(e)
+
+      await update($, originals, current =>
+        pruneOriginals({ ...current, [messageId]: item.original }),
+      )
+      await persistOriginals($)
+    } catch {
+      // 映射失败只影响查看；记录和翻译本身不受影响。
+    }
+    return next(e)
   }).catch(($, e, next) => next(e))
 }

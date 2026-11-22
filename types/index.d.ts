@@ -6,10 +6,13 @@ export type TranslationCacheEntry =
 
 export type TranslationCache = Record<string, TranslationCacheEntry>
 
+export type OriginalPrompts = Record<string, string>
+
 declare module 'claude-code' {
   interface PluginState {
     'session-translator': {
       cache: TranslationCache
+      originals: OriginalPrompts
     }
   }
 }
