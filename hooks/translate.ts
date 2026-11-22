@@ -140,16 +140,49 @@ export function persistableCache(cache: TranslationCache): TranslationCache {
 // 只把 /命令 当命令跳过；/var/... 这类路径开头的正文照常翻译。
 const SLASH_COMMAND = /^\/[A-Za-z][\w-]*(?:\s|$)/
 
+// 纯 JSON 文档（对象或数组）按结构化数据处理，不翻译；JSON 后跟正文时
+// JSON.parse 会失败，仍按普通正文处理。纯数字/字符串没有可翻译正文，
+// 交给后面的规则。
+function isJsonDocument(text: string): boolean {
+  if (!text.startsWith('{') && !text.startsWith('[')) return false
+  try {
+    JSON.parse(text)
+    return true
+  } catch {
+    return false
+  }
+}
+
+// 没加围栏的裸代码：至少两行，且多数非空行以代码关键字开头或以 ; { } =>
+// 结尾。围栏或行内代码已经变成占位符，不会把正文里的代码块算成整篇代码。
+const CODE_KEYWORD =
+  /^\s*(?:const|let|var|function|func|class|def|import|from|export|return|if|for|while|switch|try|catch|finally|async|await|public|private|protected|package|#include|using|fn|impl|struct|interface|enum|type|throw|new|case|break|continue|else|elif|do|val)\b/
+const CODE_LINE_END = /(?:[;{}]|=>)\s*$/
+
+function looksLikeCodeDocument(text: string): boolean {
+  const lines = text.split('\n').filter(line => line.trim().length > 0)
+  if (lines.length < 2) return false
+
+  let codeLines = 0
+  for (const line of lines) {
+    if (CODE_KEYWORD.test(line) || CODE_LINE_END.test(line)) codeLines += 1
+  }
+  return codeLines * 2 > lines.length
+}
+
 export function shouldTranslate(
   text: string,
   target: TranslationLanguage,
   translationRules: string,
 ): boolean {
-  if (text.trim().length === 0) return false
-  if (SLASH_COMMAND.test(text.trimStart())) return false
+  const trimmed = text.trim()
+  if (trimmed.length === 0) return false
+  if (SLASH_COMMAND.test(trimmed)) return false
+  if (isJsonDocument(trimmed)) return false
 
   const protectedText = protectText(text)
   if (!hasTranslatableProse(protectedText.text)) return false
+  if (looksLikeCodeDocument(protectedText.text)) return false
 
   const hasRules = translationRules.trim().length > 0
   if (!hasRules && detectSourceLanguage(text) === target) return false
