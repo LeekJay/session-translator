@@ -62,11 +62,6 @@ const cache = atom(
   {},
 )
 
-const originals = atom(
-  { plugin: 'session-translator', key: 'originals' } as const,
-  {},
-)
-
 const pending = new Set<string>()
 
 type PendingInput = {
@@ -141,8 +136,17 @@ function schedulePersist($: EngineInterface): void {
       persistScheduled = false
       try {
         const entries = await read($, cache)
+        let latestPersisted = persistedCache
+        try {
+          const saved = await $.store.get(CACHE_STORE_KEY)
+          if (isRecord(saved)) {
+            latestPersisted = persistableCache(saved)
+          }
+        } catch {
+          // 读取失败时回退到内存中的 persistedCache
+        }
         const merged = persistableCache(
-          pruneCache(mergeCaches(persistedCache, entries)),
+          pruneCache(mergeCaches(latestPersisted, entries)),
         )
         persistedCache = merged
         await $.store.set(CACHE_STORE_KEY, merged)
@@ -957,11 +961,7 @@ export const register: Register = (on, options) => {
       const messageId = e.requestId
       if (typeof messageId !== 'string') return next(e)
 
-      const map = await read($, originals)
-      let original = map[messageId]
-      if (original === undefined) {
-        original = await loadOriginalForMessage($, messageId, legacyOriginals)
-      }
+      const original = await loadOriginalForMessage($, messageId, legacyOriginals)
       if (original === undefined) return next(e)
 
       return next({ ...e, props: { ...e.props, text: original } })
@@ -1008,8 +1008,9 @@ export const register: Register = (on, options) => {
                 translationRules: runtime.config.translationRules,
                 model: runtime.config.model,
               })
-            } finally {
+            } catch (error) {
               pending.delete(key)
+              throw error
             }
 
             try {
@@ -1017,6 +1018,7 @@ export const register: Register = (on, options) => {
                 commit($, key, '选择项', async () => entry!),
               )
             } catch {
+              pending.delete(key)
               // 没有时钟的宿主仍然能显示这次译文，只是不缓存。
             }
           }
@@ -1152,7 +1154,17 @@ export const register: Register = (on, options) => {
       if (typeof messageId !== 'string' || messageId.length === 0) {
         return next(e)
       }
-      const text = contentText(e.message.content)
+      const rawContent = e.message.content
+      const text = contentText(
+        Array.isArray(rawContent)
+          ? rawContent.filter(
+              block =>
+                typeof block === 'object' &&
+                block !== null &&
+                (block as { type?: string }).type === 'text',
+            )
+          : rawContent,
+      )
       if (text === undefined) return next(e)
 
       const index = pendingInputs.findIndex(
@@ -1163,9 +1175,11 @@ export const register: Register = (on, options) => {
       const item = pendingInputs.splice(index, 1)[0]
       if (item === undefined) return next(e)
 
-      await update($, originals, current =>
-        pruneOriginals({ ...current, [messageId]: item.original }),
-      )
+      if (loadedOriginals.size >= MAX_ORIGINAL_PROMPTS) {
+        const oldest = loadedOriginals.keys().next().value
+        if (oldest !== undefined) loadedOriginals.delete(oldest)
+      }
+      loadedOriginals.set(messageId, item.original)
       await persistOriginal($, messageId, item.original)
     } catch {
       // 映射失败只影响查看；记录和翻译本身不受影响。

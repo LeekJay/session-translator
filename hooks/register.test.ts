@@ -231,6 +231,45 @@ test(
 )
 
 test(
+  '带非文本 block 的用户消息仍按消息 ID 显示原始中文提示',
+  { options: { translateInput: true, inputLanguage: 'en' } },
+  async ($, on) => {
+    registerRenderBottoms(on)
+    installModel(on, () => translated('Hello from the test'))
+    on('prompt.submit', ($, e) => ({ text: e.text }))
+
+    await $.prompt.submit({
+      text: '请帮我看看这个文件',
+      wait: false,
+      origin: { kind: 'composer' },
+    })
+    await $.session.append({
+      message: {
+        type: 'user',
+        role: 'user',
+        isMeta: false,
+        content: [
+          { type: 'image', source: { type: 'base64', data: 'abc' } },
+          { type: 'text', text: 'Hello from the test' },
+        ],
+      },
+      door: 'user',
+      origin: { kind: 'composer' },
+      uuid: 'm-user-image-1',
+    } as never)
+
+    const translatedRow = await $.ui.render(
+      userMessageInput(
+        'Hello from the test',
+        { kind: 'composer' },
+        'm-user-image-1',
+      ),
+    )
+    expect(drawnText(translatedRow)).toBe('请帮我看看这个文件')
+  },
+)
+
+test(
   '两条不同原文译成同一文本时各显示自己的原文',
   { options: { translateInput: true, inputLanguage: 'en' } },
   async ($, on) => {
