@@ -9,7 +9,9 @@ type Pattern = { pattern: RegExp; group: number }
 
 const PATTERNS: readonly Pattern[] = [
   { pattern: /(```|~~~)[\s\S]*?\1/g, group: 0 },
-  { pattern: /`[^`\n]+`/g, group: 0 },
+  // 反引号必须成对且长度相同。否则围栏结尾的第三个反引号会被当成
+  // 行内代码起点，把围栏与后面行内代码之间的正文一起吞进受保护片段。
+  { pattern: /(?<!`)(`+)(?!`)[^`\n]+?\1(?!`)/g, group: 0 },
   { pattern: /<\/?[A-Za-z][^>]*>/g, group: 0 },
   { pattern: /\{\{[\s\S]*?\}\}/g, group: 0 },
   { pattern: /\$\{[^{}]*\}/g, group: 0 },
