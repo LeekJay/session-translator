@@ -70,14 +70,7 @@ function stripCodeFence(response: string): string {
   return fenced?.[1]?.trim() ?? trimmed
 }
 
-export function parseTranslationResponse(response: string): string | undefined {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(stripCodeFence(response))
-  } catch {
-    return undefined
-  }
-
+function translationValue(parsed: unknown): string | undefined {
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
     return undefined
   }
@@ -85,4 +78,86 @@ export function parseTranslationResponse(response: string): string | undefined {
   // 多出的字段不影响译文；缺 translation 或类型不对才算失败。
   const value = (parsed as Record<string, unknown>).translation
   return typeof value === 'string' ? value : undefined
+}
+
+// 宽容解码 JSON 字符串内容。未转义的引号意味着内容结构不明（可能是别的键，
+// 也可能是没转义正文引号），不做猜测，返回 undefined 交给重试。
+function decodeLooseString(raw: string): string | undefined {
+  let out = ''
+  for (let i = 0; i < raw.length; i += 1) {
+    const ch = raw[i]
+    if (ch === '"') return undefined
+    if (ch !== '\\') {
+      out += ch
+      continue
+    }
+
+    const next = raw[i + 1]
+    if (next === undefined) {
+      out += ch
+      break
+    }
+    if (next === '"' || next === '\\' || next === '/') {
+      out += next
+      i += 1
+      continue
+    }
+    if (next === 'n') {
+      out += '\n'
+      i += 1
+      continue
+    }
+    if (next === 'r') {
+      out += '\r'
+      i += 1
+      continue
+    }
+    if (next === 't') {
+      out += '\t'
+      i += 1
+      continue
+    }
+    if (next === 'b') {
+      out += '\b'
+      i += 1
+      continue
+    }
+    if (next === 'f') {
+      out += '\f'
+      i += 1
+      continue
+    }
+    if (next === 'u' && /^[0-9a-fA-F]{4}$/.test(raw.slice(i + 2, i + 6))) {
+      out += String.fromCharCode(parseInt(raw.slice(i + 2, i + 6), 16))
+      i += 5
+      continue
+    }
+    // 未知转义按字面保留，避免吞掉正文。
+    out += ch + next
+    i += 1
+  }
+  return out
+}
+
+// 模型偶尔把多行译文直接写进 JSON 字符串（未转义换行）。严格解析失败时，
+// 只在 "单个 translation 键" 的固定形状下按字面取回内容。
+function parseLooseTranslation(text: string): string | undefined {
+  const head = /^\{\s*"translation"\s*:\s*"/.exec(text)
+  if (head === null) return undefined
+
+  const body = text.slice(head[0].length)
+  const tail = /\s*"\s*\}$/.exec(body)
+  if (tail === null) return undefined
+
+  return decodeLooseString(body.slice(0, tail.index))
+}
+
+export function parseTranslationResponse(response: string): string | undefined {
+  const text = stripCodeFence(response)
+  try {
+    return translationValue(JSON.parse(text))
+  } catch {
+    // 严格解析失败时走宽容解析；仍失败就交给调用方重试。
+  }
+  return parseLooseTranslation(text)
 }
