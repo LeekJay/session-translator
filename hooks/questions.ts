@@ -472,6 +472,12 @@ function splitAnswer(
     if (parts === undefined) return [{ kind: 'free', text: value }]
     return segmentsFromParts(parts, labels, false)
   }
+  // 单选答案是一整条。先按整串匹配标签：标签本身可能含 ", "，
+  // 拆开会把它误判成自由文本。
+  if (typeof value === 'string') {
+    const label = labels.get(value)
+    if (label !== undefined) return [{ kind: 'label', text: label }]
+  }
   return segmentsFromParts(answerParts(value), labels, true)
 }
 

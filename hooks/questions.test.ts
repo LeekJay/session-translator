@@ -504,6 +504,34 @@ test('多选答案里的坏引号整段回退为自由文本', {}, async () => {
   expect(back.answers).toEqual({ 'Which?': '"Drop, broken tail"' })
 })
 
+test('单选答案的标签本身含逗号时整串映射回原标签', {}, async () => {
+  const questions = [
+    {
+      question: 'Which?',
+      multiSelect: false,
+      options: [{ label: 'Keep, always' }, { label: 'Drop' }],
+    },
+  ]
+  const translated = rewriteQuestions(questions, [
+    '哪个？',
+    '保留, 永远',
+    '放弃',
+  ]) as unknown[]
+
+  const result = { questions: translated, answers: { '哪个？': '保留, 永远' } }
+
+  // 整串命中标签，不能拆成 ["保留", "永远"] 后当成自由文本。
+  expect(freeTextAnswers(result, questions, translated)).toEqual([])
+
+  const back = translateAnswers(
+    result,
+    questions,
+    translated,
+  ) as Record<string, unknown>
+
+  expect(back.answers).toEqual({ 'Which?': 'Keep, always' })
+})
+
 test('单选答案不按多选串联格式解码', {}, async () => {
   const questions = [
     {
