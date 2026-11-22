@@ -1,4 +1,5 @@
 import type { TranslationLanguage } from '../types'
+import { PLACEHOLDER_PATTERN } from './protect'
 
 const LANGUAGE_NAMES: Record<TranslationLanguage, string> = {
   en: 'English',
@@ -32,7 +33,6 @@ export function isTranslationLanguage(
 const KANA = /[぀-ヿㇰ-ㇿ･-ﾟ]/
 const HAN = /^\p{Script=Han}$/u
 const LATIN = /^\p{Script=Latin}$/u
-const PLACEHOLDER = /@@JXZ_TRANSLATION_\d+@@/g
 
 const LATIN_ACCENT = /[\u00C0-\u024F\u1E00-\u1EFF]/
 const LATIN_WORD = /[\p{Script=Latin}]+/gu
@@ -90,7 +90,7 @@ export function isUsableTranslation(
   language: TranslationLanguage,
   sourceProseLength = 0,
 ): boolean {
-  const prose = text.replace(PLACEHOLDER, ' ').trim()
+  const prose = text.replace(PLACEHOLDER_PATTERN, ' ').trim()
   if (prose.length === 0) return false
 
   if (sourceProseLength > 400 && prose.length < sourceProseLength * 0.3) {

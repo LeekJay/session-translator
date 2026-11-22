@@ -1138,7 +1138,7 @@ test(
       {
         question: 'Which library?',
         header: 'Library',
-        multiSelect: false,
+        multiSelect: true,
         options: [
           { label: 'Alpha', description: 'First option.' },
           { label: 'Beta', description: 'Second option.' },
@@ -1197,7 +1197,7 @@ test(
       {
         question: 'Which library?',
         header: 'Library',
-        multiSelect: false,
+        multiSelect: true,
         options: [
           { label: 'Alpha', description: 'First option.' },
           { label: 'Beta', description: 'Second option.' },
@@ -1302,7 +1302,7 @@ test(
       {
         question: 'Which library?',
         header: 'Library',
-        multiSelect: false,
+        multiSelect: true,
         options: [
           { label: 'Alpha', description: 'First option.' },
           { label: 'Beta', description: 'Second option.' },
@@ -1369,7 +1369,7 @@ test(
       {
         question: 'Which library?',
         header: 'Library',
-        multiSelect: false,
+        multiSelect: true,
         options: [
           { label: 'Alpha', description: 'First option.' },
           { label: 'Beta', description: 'Second option.' },
@@ -1664,13 +1664,61 @@ test(
 )
 
 test(
+  '持久化缓存时会合并其他会话后写入的条目，不互相覆盖',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    const clock = mock.clock(on)
+    let storedCache: unknown
+    on('store.get', { key: 'cache' }, () => ({ value: storedCache }))
+    on('store.set', { key: 'cache' }, (_$, e) => {
+      storedCache = e.value
+      return { value: undefined }
+    })
+    registerRenderBottoms(on)
+    installModel(on, () => translated('这是本会话的译文。'))
+
+    const signature = translationSignature({
+      inputLanguage: 'en',
+      outputLanguage: 'zh',
+      model: 'haiku',
+      translationRules: '',
+      promptVersion: PROMPT_TAG,
+    })
+    const localSource = 'Reply translated in this session.'
+    const localKey = cacheKey(signature, 'zh', 'output', localSource)
+    const externalKey = cacheKey(
+      signature,
+      'zh',
+      'output',
+      'Reply translated in another session.',
+    )
+
+    await $.ui.render(assistantInput(localSource))
+
+    storedCache = {
+      [externalKey]: { status: 'translated', text: '另一会话的译文。' },
+    }
+
+    await clock.advance(1)
+    await clock.settle()
+    await clock.advance(1000)
+    await clock.settle()
+
+    expect(storedCache).toEqual({
+      [externalKey]: { status: 'translated', text: '另一会话的译文。' },
+      [localKey]: { status: 'translated', text: '这是本会话的译文。' },
+    })
+  },
+)
+
+test(
   '占位符缺失时保留原文并缓存失败',
   { options: { translateOutput: true, outputLanguage: 'zh' } },
   async ($, on) => {
     const clock = mock.clock(on)
     registerRenderBottoms(on)
     const calls = installModel(on, source => {
-      const placeholders = source.match(/@@JXZ_TRANSLATION_\d+@@/g) ?? []
+      const placeholders = source.match(/@@ST_KEEP_\d+@@/g) ?? []
       return translated(`在 ${placeholders[0] ?? ''} 中使用它。`)
     })
 
@@ -1755,7 +1803,7 @@ test(
     const source = '```ts\n' + 'const value = 1\n'.repeat(40) + '```\n' + prose
     const calls = installModel(on, protectedSource => {
       const placeholder =
-        protectedSource.match(/@@JXZ_TRANSLATION_\d+@@/)?.[0] ?? ''
+        protectedSource.match(/@@ST_KEEP_\d+@@/)?.[0] ?? ''
       return translated(
         `${placeholder}\n${'这段说明解释了改动细节。'.repeat(15)}`,
       )

@@ -61,7 +61,8 @@ test('改写替换文本字段并保留结构和预览', {}, async () => {
 })
 
 test('答案映射回原问题文本与英文标签', {}, async () => {
-  const translated = rewriteQuestions(QUESTIONS, [
+  const questions = [{ ...QUESTIONS[0], multiSelect: true }]
+  const translated = rewriteQuestions(questions, [
     '用哪个测试库？',
     '测试库',
     '维特',
@@ -79,11 +80,11 @@ test('答案映射回原问题文本与英文标签', {}, async () => {
 
   const back = translateAnswers(
     result,
-    QUESTIONS,
+    questions,
     translated,
   ) as Record<string, unknown>
 
-  expect(back.questions).toBe(QUESTIONS)
+  expect(back.questions).toBe(questions)
   expect(back.answers).toEqual({
     'Which library should we use?': 'Vitest, Jest',
   })
@@ -344,7 +345,8 @@ test('冲突的选项译名按自由文本还原，不错绑到后一个选项',
 })
 
 test('自由答案按整串翻译回填，不拆逗号', {}, async () => {
-  const translated = rewriteQuestions(QUESTIONS, [
+  const questions = [{ ...QUESTIONS[0], multiSelect: true }]
+  const translated = rewriteQuestions(questions, [
     '用哪个测试库？',
     '测试库',
     '维特',
@@ -364,13 +366,13 @@ test('自由答案按整串翻译回填，不拆逗号', {}, async () => {
 
   const back = translateAnswers(
     result,
-    QUESTIONS,
+    questions,
     translated,
     new Map([[source, target]]),
   ) as Record<string, unknown>
 
   expect(back.answers).toEqual({
-    'Which library should we use?': `Vitest, ${target}`,
+    'Which library should we use?': `Vitest, ${JSON.stringify(target)}`,
   })
   expect(back.response).toBe(target)
 })
@@ -558,6 +560,36 @@ test('单选答案不按多选串联格式解码', {}, async () => {
   ) as Record<string, unknown>
 
   expect(back.answers).toEqual({ 'Which?': raw })
+})
+
+test('单选自由答案含选项标签与逗号时不拆分也不替换部分标签', {}, async () => {
+  const questions = [
+    {
+      question: 'Which?',
+      multiSelect: false,
+      options: [{ label: 'Keep' }, { label: 'Drop' }],
+    },
+  ]
+  const translated = rewriteQuestions(questions, [
+    '哪个？',
+    '保留',
+    '放弃',
+  ]) as unknown[]
+
+  const raw = '保留, 但先备份'
+  const target = 'Keep it, but back up first'
+  const result = { questions: translated, answers: { '哪个？': raw } }
+
+  expect(freeTextAnswers(result, questions, translated)).toEqual([raw])
+
+  const back = translateAnswers(
+    result,
+    questions,
+    translated,
+    new Map([[raw, target]]),
+  ) as Record<string, unknown>
+
+  expect(back.answers).toEqual({ 'Which?': target })
 })
 
 test('备注按整段原文保留，不按多选答案解码或做标签映射', {}, async () => {

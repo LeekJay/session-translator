@@ -461,22 +461,27 @@ function segmentsFromParts(
   return segments
 }
 
+type AnswerMode = 'encoded' | 'single' | 'split'
+
 function splitAnswer(
   value: unknown,
   labels: ReadonlyMap<string, string>,
-  encoded: boolean,
+  mode: AnswerMode,
 ): AnswerSegment[] {
-  if (encoded && typeof value === 'string') {
+  if (mode === 'encoded' && typeof value === 'string') {
     const parts = encodedAnswerParts(value)
     // 解析失败时保守地回退为整段文本，不做标签映射，也不能抛错。
     if (parts === undefined) return [{ kind: 'free', text: value }]
     return segmentsFromParts(parts, labels, false)
   }
-  // 单选答案是一整条。先按整串匹配标签：标签本身可能含 ", "，
-  // 拆开会把它误判成自由文本。
   if (typeof value === 'string') {
     const label = labels.get(value)
     if (label !== undefined) return [{ kind: 'label', text: label }]
+    // 单选答案是一整条：未命中整串标签时按整段自由文本处理，
+    // 不按 ", " 拆分，避免手输内容里碰巧出现选项标签而被误判。
+    if (mode === 'single') {
+      return value.trim().length > 0 ? [{ kind: 'free', text: value }] : []
+    }
   }
   return segmentsFromParts(answerParts(value), labels, true)
 }
@@ -498,9 +503,9 @@ export function freeTextAnswers(
   const push = (
     value: unknown,
     labels: ReadonlyMap<string, string>,
-    encoded: boolean,
+    mode: AnswerMode,
   ): void => {
-    for (const segment of splitAnswer(value, labels, encoded)) {
+    for (const segment of splitAnswer(value, labels, mode)) {
       if (segment.kind !== 'free') continue
       if (texts.includes(segment.text)) continue
       texts.push(segment.text)
@@ -517,20 +522,23 @@ export function freeTextAnswers(
 
   if (isRecord(result.answers)) {
     for (const [key, value] of Object.entries(result.answers)) {
-      push(value, labelsFor(key, maps), multiSelectAnswer(key, maps))
+      const mode: AnswerMode = multiSelectAnswer(key, maps)
+        ? 'encoded'
+        : 'single'
+      push(value, labelsFor(key, maps), mode)
     }
   }
   if (isRecord(result.annotations)) {
     for (const [key, value] of Object.entries(result.annotations)) {
       if (!isRecord(value)) {
-        push(value, labelsFor(key, maps), false)
+        push(value, labelsFor(key, maps), 'split')
         continue
       }
       const notes = annotationNotes(value)
       if (notes !== undefined) pushNote(notes)
     }
   }
-  push(result.response, maps.labels, false)
+  push(result.response, maps.labels, 'split')
 
   return texts
 }
@@ -552,15 +560,15 @@ export function translateAnswers(
   const restoreValue = (
     value: unknown,
     labels: ReadonlyMap<string, string>,
-    encoded: boolean,
+    mode: AnswerMode,
   ): unknown => {
-    return splitAnswer(value, labels, encoded)
+    return splitAnswer(value, labels, mode)
       .map(segment => {
         const text =
           segment.kind === 'label'
             ? segment.text
             : freeText.get(segment.text) ?? segment.text
-        return encoded ? encodeAnswerPart(text) : text
+        return mode === 'encoded' ? encodeAnswerPart(text) : text
       })
       .join(ANSWER_SEPARATOR)
   }
@@ -575,7 +583,11 @@ export function translateAnswers(
     out.answers = Object.fromEntries(
       Object.entries(result.answers).map(([key, value]) => [
         maps.questions.get(key) ?? key,
-        restoreValue(value, labelsFor(key, maps), multiSelectAnswer(key, maps)),
+        restoreValue(
+          value,
+          labelsFor(key, maps),
+          multiSelectAnswer(key, maps) ? 'encoded' : 'single',
+        ),
       ]),
     )
   }
@@ -586,7 +598,7 @@ export function translateAnswers(
       value: unknown,
       labels: ReadonlyMap<string, string>,
     ): unknown => {
-      if (typeof value === 'string') return restoreValue(value, labels, false)
+      if (typeof value === 'string') return restoreValue(value, labels, 'split')
       if (!isRecord(value)) return value
       const notes = annotationNotes(value)
       return notes === undefined
@@ -603,7 +615,7 @@ export function translateAnswers(
   }
 
   if (typeof result.response === 'string') {
-    out.response = restoreValue(result.response, maps.labels, false)
+    out.response = restoreValue(result.response, maps.labels, 'split')
   }
 
   return out

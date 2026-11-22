@@ -13,85 +13,85 @@ const CASES: readonly ProtectionCase[] = [
     name: '代码围栏',
     text: '先看这段：\n```ts\nconst n = 1\n```\n然后继续。',
     fragment: '```ts\nconst n = 1\n```',
-    protectedText: '先看这段：\n@@JXZ_TRANSLATION_1@@\n然后继续。',
+    protectedText: '先看这段：\n@@ST_KEEP_1@@\n然后继续。',
   },
   {
     name: '行内代码',
     text: '运行 `npm test` 看看。',
     fragment: '`npm test`',
-    protectedText: '运行 @@JXZ_TRANSLATION_1@@ 看看。',
+    protectedText: '运行 @@ST_KEEP_1@@ 看看。',
   },
   {
     name: 'HTML 标签',
     text: '点击 <button class="primary"> 按钮。',
     fragment: '<button class="primary">',
-    protectedText: '点击 @@JXZ_TRANSLATION_1@@ 按钮。',
+    protectedText: '点击 @@ST_KEEP_1@@ 按钮。',
   },
   {
     name: '双花括号占位符',
     text: '保留 {{user.name}} 不变。',
     fragment: '{{user.name}}',
-    protectedText: '保留 @@JXZ_TRANSLATION_1@@ 不变。',
+    protectedText: '保留 @@ST_KEEP_1@@ 不变。',
   },
   {
     name: '美元花括号占位符',
     text: '保留 ${userName} 不变。',
     fragment: '${userName}',
-    protectedText: '保留 @@JXZ_TRANSLATION_1@@ 不变。',
+    protectedText: '保留 @@ST_KEEP_1@@ 不变。',
   },
   {
     name: 'URL',
     text: '见 https://example.com/docs?q=1 说明。',
     fragment: 'https://example.com/docs?q=1',
-    protectedText: '见 @@JXZ_TRANSLATION_1@@ 说明。',
+    protectedText: '见 @@ST_KEEP_1@@ 说明。',
   },
   {
     name: 'Windows 路径',
     text: '打开 C:\\Temp\\app.log 查看。',
     fragment: 'C:\\Temp\\app.log',
-    protectedText: '打开 @@JXZ_TRANSLATION_1@@ 查看。',
+    protectedText: '打开 @@ST_KEEP_1@@ 查看。',
   },
   {
     name: 'Unix 绝对路径',
     text: '配置在 /etc/nginx/nginx.conf 里。',
     fragment: '/etc/nginx/nginx.conf',
-    protectedText: '配置在 @@JXZ_TRANSLATION_1@@ 里。',
+    protectedText: '配置在 @@ST_KEEP_1@@ 里。',
   },
   {
     name: 'Unix 相对路径',
     text: '改 ./src/index.ts 文件。',
     fragment: './src/index.ts',
-    protectedText: '改 @@JXZ_TRANSLATION_1@@ 文件。',
+    protectedText: '改 @@ST_KEEP_1@@ 文件。',
   },
   {
     name: 'snake_case 标识符',
     text: '把 user_name 传进去。',
     fragment: 'user_name',
-    protectedText: '把 @@JXZ_TRANSLATION_1@@ 传进去。',
+    protectedText: '把 @@ST_KEEP_1@@ 传进去。',
   },
   {
     name: 'camelCase 标识符',
     text: '调用 getUserName 方法。',
     fragment: 'getUserName',
-    protectedText: '调用 @@JXZ_TRANSLATION_1@@ 方法。',
+    protectedText: '调用 @@ST_KEEP_1@@ 方法。',
   },
   {
     name: 'PascalCase 标识符',
     text: '新建 HttpClient 实例。',
     fragment: 'HttpClient',
-    protectedText: '新建 @@JXZ_TRANSLATION_1@@ 实例。',
+    protectedText: '新建 @@ST_KEEP_1@@ 实例。',
   },
   {
     name: 'dotted 标识符',
     text: '读取 app.config.value 的值。',
     fragment: 'app.config.value',
-    protectedText: '读取 @@JXZ_TRANSLATION_1@@ 的值。',
+    protectedText: '读取 @@ST_KEEP_1@@ 的值。',
   },
   {
     name: '十六进制串',
     text: '提交 abc1234f 哈希。',
     fragment: 'abc1234f',
-    protectedText: '提交 @@JXZ_TRANSLATION_1@@ 哈希。',
+    protectedText: '提交 @@ST_KEEP_1@@ 哈希。',
   },
 ]
 
@@ -114,7 +114,7 @@ test('多个片段按从左到右的顺序编号并逐字还原', {}, async () =
   const protectedText = protectText(text)
 
   expect(protectedText.text).toBe(
-    '把 @@JXZ_TRANSLATION_1@@ 和 @@JXZ_TRANSLATION_2@@ 交给 @@JXZ_TRANSLATION_3@@，说明见 @@JXZ_TRANSLATION_4@@ 结束。',
+    '把 @@ST_KEEP_1@@ 和 @@ST_KEEP_2@@ 交给 @@ST_KEEP_3@@，说明见 @@ST_KEEP_4@@ 结束。',
   )
   expect(protectedText.values).toEqual([
     'user_name',
@@ -133,12 +133,12 @@ test('代码块与行内代码里的嵌套片段合并为单个占位符', {}, a
   const protectedText = protectText(text)
 
   expect(protectedText.text).toBe(
-    '先执行 @@JXZ_TRANSLATION_1@@，再运行 @@JXZ_TRANSLATION_2@@，最后说明。',
+    '先执行 @@ST_KEEP_1@@，再运行 @@ST_KEEP_2@@，最后说明。',
   )
   expect(protectedText.values).toEqual([fenced, inline])
-  expect(protectedText.text.match(/@@JXZ_TRANSLATION_\d+@@/g)).toEqual([
-    '@@JXZ_TRANSLATION_1@@',
-    '@@JXZ_TRANSLATION_2@@',
+  expect(protectedText.text.match(/@@ST_KEEP_\d+@@/g)).toEqual([
+    '@@ST_KEEP_1@@',
+    '@@ST_KEEP_2@@',
   ])
   expect(restoreText(protectedText.text, protectedText.values)).toBe(text)
 })

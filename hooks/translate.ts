@@ -6,6 +6,7 @@ import type {
 } from '../types'
 import { detectSourceLanguage, isUsableTranslation } from './languages'
 import {
+  PLACEHOLDER_PATTERN,
   hasTranslatableProse,
   protectText,
   restoreText,
@@ -24,8 +25,6 @@ const TRANSIENT_FAILURES: readonly string[] = [
 export function isTransientFailure(reason: string): boolean {
   return TRANSIENT_FAILURES.some(prefix => reason.startsWith(prefix))
 }
-
-const PLACEHOLDER_PATTERN = /@@JXZ_TRANSLATION_\d+@@/g
 
 export type PreparedTranslation = {
   readonly system: string
@@ -186,7 +185,8 @@ export function shouldTranslate(
   if (looksLikeCodeDocument(protectedText.text)) return false
 
   const hasRules = translationRules.trim().length > 0
-  if (!hasRules && detectSourceLanguage(text) === target) return false
+  const prose = protectedText.text.replace(PLACEHOLDER_PATTERN, ' ')
+  if (!hasRules && detectSourceLanguage(prose) === target) return false
 
   return true
 }

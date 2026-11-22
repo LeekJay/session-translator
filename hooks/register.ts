@@ -139,7 +139,7 @@ function schedulePersist($: EngineInterface): void {
         let latestPersisted = persistedCache
         try {
           const saved = await $.store.get(CACHE_STORE_KEY)
-          if (isRecord(saved)) {
+          if (isTranslationCache(saved)) {
             latestPersisted = persistableCache(saved)
           }
         } catch {
@@ -164,18 +164,6 @@ function schedulePersist($: EngineInterface): void {
 // 不会像整表回写那样互相覆盖丢数据。
 const ORIGINALS_KEY_PREFIX = 'originals:'
 const MAX_ORIGINAL_PROMPTS = 2000
-
-function pruneOriginals(map: OriginalPrompts): OriginalPrompts {
-  const keys = Object.keys(map)
-  if (keys.length <= MAX_ORIGINAL_PROMPTS) return map
-
-  const kept: OriginalPrompts = {}
-  for (const key of keys.slice(keys.length - MAX_ORIGINAL_PROMPTS)) {
-    const value = map[key]
-    if (value !== undefined) kept[key] = value
-  }
-  return kept
-}
 
 function storedOriginalKey(messageId: string): string {
   return `${ORIGINALS_KEY_PREFIX}${messageId}`

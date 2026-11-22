@@ -46,8 +46,10 @@ function collect(text: string, { pattern, group }: Pattern): Range[] {
   return ranges
 }
 
+export const PLACEHOLDER_PATTERN = /@@ST_KEEP_(\d+)@@/g
+
 function placeholder(index: number): string {
-  return `@@JXZ_TRANSLATION_${index}@@`
+  return `@@ST_KEEP_${index}@@`
 }
 
 export function protectText(text: string): ProtectedText {
@@ -88,7 +90,7 @@ export function restoreText(
   values: readonly string[],
 ): string {
   const seen = new Set<number>()
-  const pattern = /@@JXZ_TRANSLATION_(\d+)@@/g
+  const pattern = new RegExp(PLACEHOLDER_PATTERN.source, 'g')
 
   let match: RegExpExecArray | null
   while ((match = pattern.exec(text)) !== null) {
@@ -107,12 +109,12 @@ export function restoreText(
   }
 
   return text.replace(
-    /@@JXZ_TRANSLATION_(\d+)@@/g,
+    PLACEHOLDER_PATTERN,
     (whole, digits: string) => values[Number(digits) - 1] ?? whole,
   )
 }
 
 export function hasTranslatableProse(protectedText: string): boolean {
-  const prose = protectedText.replace(/@@JXZ_TRANSLATION_\d+@@/g, ' ')
+  const prose = protectedText.replace(PLACEHOLDER_PATTERN, ' ')
   return /\p{L}/u.test(prose)
 }

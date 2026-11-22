@@ -28,7 +28,7 @@ GitHub：
 | `/translator input <en\|zh\|ja\|fr\|de>` | 设置模型语言 |
 | `/translator output <en\|zh\|ja\|fr\|de>` | 设置显示语言 |
 | `/translator model <name>` | 设置翻译模型 |
-| `/translator rules <text>` | 追加自定义规则，每行一条 |
+| `/translator rules <text>` | 设置自定义规则（覆盖原规则，留空清空） |
 | `/translator reset` | 恢复默认 |
 | `/translator-test` | 打印一次模型原始回复，排查用 |
 

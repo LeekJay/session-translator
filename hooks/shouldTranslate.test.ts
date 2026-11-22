@@ -141,3 +141,7 @@ test('自定义规则也不翻译裸代码', {}, async () => {
   const snippet = 'const value = 1\nreturn value'
   expect(shouldTranslate(snippet, 'zh', '- 保留术语')).toBe(false)
 })
+
+test('行内代码含目标语言字符时仍按正文语言翻译', {}, async () => {
+  expect(shouldTranslate('Explain `あ`', 'ja', '')).toBe(true)
+})

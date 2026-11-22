@@ -12,7 +12,6 @@ declare module 'claude-code' {
   interface PluginState {
     'session-translator': {
       cache: TranslationCache
-      originals: OriginalPrompts
     }
   }
 }
