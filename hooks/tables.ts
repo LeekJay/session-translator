@@ -36,7 +36,7 @@ function wideChar(char: string): boolean {
   )
 }
 
-export function displayWidth(text: string): number {
+function displayWidth(text: string): number {
   let width = 0
   for (const char of text) width += wideChar(char) ? 2 : 1
   return width

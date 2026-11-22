@@ -13,7 +13,7 @@ import {
 import type { TranslationKind } from './prompt'
 import { buildTranslationRequest, parseTranslationResponse } from './prompt'
 
-export const MAX_CACHE_ENTRIES = 300
+const MAX_CACHE_ENTRIES = 300
 
 const TRANSIENT_FAILURES: readonly string[] = [
   'api-error',
