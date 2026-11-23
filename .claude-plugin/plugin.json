@@ -1,6 +1,6 @@
 {
   "name": "session-translator",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "把提示替换成模型语言的译文后提交，把回复翻译成你的语言；会话记录和发给主模型的是译文，原文按消息 ID 保存在本机插件存储，宿主支持用户消息渲染钩子时可显示原文。",
   "author": { "name": "LeekJay" },
   "license": "MIT",
