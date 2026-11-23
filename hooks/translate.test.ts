@@ -3,7 +3,9 @@ import { isUsableTranslation } from './languages'
 import {
   cacheKey,
   finalizeTranslation,
+  formatUnanswered,
   isSlashCommand,
+  isTransientFailure,
   MAX_CACHE_CHARS,
   prepareTranslation,
   pruneCache,
@@ -173,4 +175,73 @@ test('斜杠命令仅匹配字母开头的命令名', {}, async () => {
   expect(isSlashCommand('/pstack:poteto-mode')).toBe(true)
   expect(isSlashCommand('/123 你好')).toBe(false)
   expect(isSlashCommand('/-flag 这是什么')).toBe(false)
+})
+
+test('区分瞬时 API 失败与永久配置或鉴权失败', {}, async () => {
+  const usage = {
+    input_tokens: 12,
+    output_tokens: 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+  }
+  const overloaded = formatUnanswered({
+    isAnswered: false,
+    reason: 'api-error',
+    error: 'overloaded',
+    status: 529,
+    usage,
+  })
+  expect(overloaded).toBe('api-error:overloaded (status=529, out=0, in=12)')
+  expect(isTransientFailure(overloaded)).toBe(true)
+  expect(
+    isTransientFailure(
+      formatUnanswered({
+        isAnswered: false,
+        reason: 'api-error',
+        error: 'rate_limit',
+        status: 429,
+        usage,
+      }),
+    ),
+  ).toBe(true)
+  expect(
+    isTransientFailure(
+      formatUnanswered({
+        isAnswered: false,
+        reason: 'api-error',
+        error: 'server_error',
+        status: 500,
+        usage,
+      }),
+    ),
+  ).toBe(true)
+  expect(
+    isTransientFailure(
+      formatUnanswered({
+        isAnswered: false,
+        reason: 'api-error',
+        error: 'unknown',
+        status: null,
+        usage,
+      }),
+    ),
+  ).toBe(true)
+
+  for (const permanent of [
+    'model_not_found',
+    'authentication_failed',
+    'billing_error',
+    'invalid_request',
+  ] as const) {
+    const formatted = formatUnanswered({
+      isAnswered: false,
+      reason: 'api-error',
+      error: permanent,
+      status: 400,
+      usage,
+    })
+    expect(formatted).toContain(`api-error:${permanent}`)
+    expect(formatted).toContain('status=400')
+    expect(isTransientFailure(formatted)).toBe(false)
+  }
 })

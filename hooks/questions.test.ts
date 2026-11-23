@@ -592,6 +592,42 @@ test('单选自由答案含选项标签与逗号时不拆分也不替换部分�
   expect(back.answers).toEqual({ 'Which?': target })
 })
 
+test('response 自由文本含选项标签与逗号时整句收集并翻译，不替换句中标签', {}, async () => {
+  const questions = [
+    {
+      question: 'Which?',
+      multiSelect: false,
+      options: [{ label: 'Keep' }, { label: 'Drop' }],
+    },
+  ]
+  const translated = rewriteQuestions(questions, [
+    '哪个？',
+    '保留',
+    '放弃',
+  ]) as unknown[]
+
+  const raw = '先别删, 保留, 等测试通过再说'
+  const target = 'Do not delete yet, keep it, wait until tests pass'
+  const result = { questions: translated, response: raw }
+
+  expect(freeTextAnswers(result, questions, translated)).toEqual([raw])
+
+  const withoutTranslation = translateAnswers(
+    result,
+    questions,
+    translated,
+  ) as Record<string, unknown>
+  expect(withoutTranslation.response).toBe(raw)
+
+  const back = translateAnswers(
+    result,
+    questions,
+    translated,
+    new Map([[raw, target]]),
+  ) as Record<string, unknown>
+  expect(back.response).toBe(target)
+})
+
 test('备注按整段原文保留，不按多选答案解码或做标签映射', {}, async () => {
   const translated = translatedMulti()
   const notes = [

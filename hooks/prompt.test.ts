@@ -59,4 +59,13 @@ test('内容里有未转义引号时不做猜测', {}, async () => {
 
 test('截断的 JSON 不做推测', {}, async () => {
   expect(parseTranslationResponse('{"translation":"第一行')).toBeUndefined()
+  expect(
+    parseTranslationResponse('{"translation":"第一行\n他说 \\"}'),
+  ).toBeUndefined()
+})
+
+test('未转义换行译文保留末尾换行', {}, async () => {
+  expect(
+    parseTranslationResponse('{"translation":"第一行\n第二行\n"}'),
+  ).toBe('第一行\n第二行\n')
 })

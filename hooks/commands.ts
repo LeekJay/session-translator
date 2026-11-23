@@ -29,7 +29,7 @@ const DEFAULTS: Options = {
 // 加新设置时 Options 类型和 DEFAULTS 会先让编译器报错，这里无需再改。
 export const SETTING_KEYS = Object.keys(DEFAULTS) as (keyof Options)[]
 
-export const USAGE_LINE =
+const USAGE_LINE =
   'usage: /translator [status|on|off|input <en|zh|ja|fr|de>|output <en|zh|ja|fr|de>|model <name>|rules <text>|reset]'
 
 export const TRANSLATOR_TEST_PROMPT =
@@ -229,6 +229,14 @@ function usageLine(result: ModelCompleteResult): string {
   return `usage: out=${result.usage.output_tokens}, in=${result.usage.input_tokens}`
 }
 
+function failureReason(
+  result: Exclude<ModelCompleteResult, { isAnswered: true }>,
+): string {
+  return result.reason === 'api-error'
+    ? `api-error (${result.error}, status=${result.status ?? 'none'})`
+    : result.reason
+}
+
 export function describeCompletion(
   model: string,
   result: ModelCompleteResult,
@@ -240,15 +248,17 @@ export function describeCompletion(
       usageLine(result),
     ].join('\n')
   }
-  return [`model: ${model}`, `reason: ${result.reason}`, usageLine(result)].join(
-    '\n',
-  )
+  return [
+    `model: ${model}`,
+    `reason: ${failureReason(result)}`,
+    usageLine(result),
+  ].join('\n')
 }
 
 export function describeSonnet(result: ModelCompleteResult): string {
   return result.isAnswered
     ? `sonnet: ${result.text}\nsonnet ${usageLine(result)}`
-    : `sonnet reason: ${result.reason}\nsonnet ${usageLine(result)}`
+    : `sonnet reason: ${failureReason(result)}\nsonnet ${usageLine(result)}`
 }
 
 export function needsSonnet(result: ModelCompleteResult): boolean {

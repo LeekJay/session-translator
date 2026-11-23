@@ -94,8 +94,7 @@ function decodeLooseString(raw: string): string | undefined {
 
     const next = raw[i + 1]
     if (next === undefined) {
-      out += ch
-      break
+      return undefined
     }
     if (next === '"' || next === '\\' || next === '/') {
       out += next
@@ -146,8 +145,14 @@ function parseLooseTranslation(text: string): string | undefined {
   if (head === null) return undefined
 
   const body = text.slice(head[0].length)
-  const tail = /\s*"\s*\}$/.exec(body)
+  const tail = /"\s*\}$/.exec(body)
   if (tail === null) return undefined
+
+  let backslashes = 0
+  for (let i = tail.index - 1; i >= 0 && body[i] === '\\'; i -= 1) {
+    backslashes += 1
+  }
+  if (backslashes % 2 === 1) return undefined
 
   return decodeLooseString(body.slice(0, tail.index))
 }

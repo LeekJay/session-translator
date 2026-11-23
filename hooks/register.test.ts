@@ -11,14 +11,15 @@ import { PROMPT_TAG } from './prompt'
 import {
   applyStoredSettings,
   describeSettings,
-  scheduleTranslation,
   SETTING_KEYS,
   settingsPayload,
-} from './register'
-import type { Options } from './register'
+} from './commands'
+import type { Options } from './commands'
+import { scheduleTranslation } from './register'
 import {
   createStorageState,
   excessCacheKeys,
+  rememberOriginal,
   rememberPersistedEntry,
   retainPersistedKeys,
   storedCacheEntrySizeKey,
@@ -3187,6 +3188,7 @@ test('每个设置键都能持久化、恢复并显示在 status 里', {}, async
 
 test('时钟缺失或抛错时清掉 pending，下一次还能重试', {}, async () => {
   const key = 'schedule-failure-retry'
+  const pending = new Set<string>()
   let started = 0
   const start = () => {
     started += 1
@@ -3196,7 +3198,12 @@ test('时钟缺失或抛错时清掉 pending，下一次还能重试', {}, async
     | undefined = undefined
 
   expect(
-    scheduleTranslation(callback => missing!.after(1, callback), key, start),
+    scheduleTranslation(
+      callback => missing!.after(1, callback),
+      key,
+      start,
+      pending,
+    ),
   ).toBe('failed')
   expect(
     scheduleTranslation(
@@ -3205,6 +3212,7 @@ test('时钟缺失或抛错时清掉 pending，下一次还能重试', {}, async
       },
       key,
       start,
+      pending,
     ),
   ).toBe('failed')
 
@@ -3216,6 +3224,7 @@ test('时钟缺失或抛错时清掉 pending，下一次还能重试', {}, async
       },
       key,
       start,
+      pending,
     ),
   ).toBe('scheduled')
   expect(started).toBe(0)
@@ -3225,6 +3234,7 @@ test('时钟缺失或抛错时清掉 pending，下一次还能重试', {}, async
 
 test('同一 key 已调度时返回 busy，不重复启动', {}, async () => {
   const key = 'schedule-busy-dedup'
+  const pending = new Set<string>()
   let started = 0
   const start = () => {
     started += 1
@@ -3233,9 +3243,9 @@ test('同一 key 已调度时返回 busy，不重复启动', {}, async () => {
     callback()
   }
 
-  expect(scheduleTranslation(clock, key, start)).toBe('scheduled')
+  expect(scheduleTranslation(clock, key, start, pending)).toBe('scheduled')
   expect(started).toBe(1)
-  expect(scheduleTranslation(clock, key, start)).toBe('busy')
+  expect(scheduleTranslation(clock, key, start, pending)).toBe('busy')
   expect(started).toBe(1)
 })
 
@@ -3324,3 +3334,389 @@ test(
     ).toEqual(questions)
   },
 )
+
+test(
+  '永久 API 失败在回复渲染中写入内存缓存不重请求，在输入提交中也不二次重试',
+  {
+    options: {
+      translateInput: true,
+      inputLanguage: 'en',
+      translateOutput: true,
+      outputLanguage: 'zh',
+    },
+  },
+  async ($, on) => {
+    const clock = mock.clock(on)
+    registerRenderBottoms(on)
+    let calls = 0
+    on('model.complete', () => {
+      calls += 1
+      return {
+        value: {
+          isAnswered: false as const,
+          reason: 'api-error' as const,
+          error: 'model_not_found' as const,
+          status: 404,
+          usage: USAGE,
+        },
+      }
+    })
+
+    const source = 'This reply hits a permanent model_not_found error.'
+    const first = await $.ui.render(assistantInput(source))
+    expect(drawnText(first)).toBe(source)
+
+    await clock.advance(1)
+    await clock.settle()
+    expect(calls).toBe(1)
+
+    const second = await $.ui.render(assistantInput(source))
+    expect(drawnText(second)).toBe(source)
+    await clock.advance(1)
+    await clock.settle()
+    expect(calls).toBe(1)
+
+    const submitted = (await $.prompt.submit({
+      text: '请帮我看看这个文件',
+      wait: false,
+      origin: { kind: 'composer' },
+    })) as { drop?: string }
+    expect(calls).toBe(2)
+    expect(submitted.drop).toContain('api-error:model_not_found')
+  },
+)
+
+test(
+  'AskUserQuestion 选项说明为超过 20 字符的路径或 URL 且模型原样保留时仍正常显示译文',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    let asked: Array<Record<string, unknown>> = []
+    on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
+      asked = e.questions as Array<Record<string, unknown>>
+      return { result: { questions: e.questions, answers: {} } }
+    })
+
+    const calls = installModel(
+      on,
+      () =>
+        '{"translations":["查看哪个入口？","入口","鉴权模块","src/services/authentication.ts","官方文档","https://docs.anthropic.com/en/api"]}',
+    )
+
+    const questions = [
+      {
+        question: 'Which entry should we inspect?',
+        header: 'Entry',
+        multiSelect: false,
+        options: [
+          {
+            label: 'Auth module',
+            description: 'src/services/authentication.ts',
+          },
+          {
+            label: 'Official docs',
+            description: 'https://docs.anthropic.com/en/api',
+          },
+        ],
+      },
+    ]
+
+    await $.tool.call({ tool: 'AskUserQuestion', questions })
+
+    expect(calls()).toBe(1)
+    expect(asked[0]?.question).toBe('查看哪个入口？')
+    const options = asked[0]?.options as Array<Record<string, unknown>>
+    expect(options[0]?.label).toBe('鉴权模块')
+    expect(options[0]?.description).toBe('src/services/authentication.ts')
+    expect(options[1]?.label).toBe('官方文档')
+    expect(options[1]?.description).toBe('https://docs.anthropic.com/en/api')
+  },
+)
+
+test(
+  '下游 prompt.submit 丢弃提交时移除暂存原文，且 session.append 忽略非普通用户行',
+  { options: { translateInput: true, inputLanguage: 'en' } },
+  async ($, on) => {
+    registerRenderBottoms(on)
+    installModel(on, () => translated('OK'))
+    let dropFirst = true
+    on('prompt.submit', ($, e) => {
+      if (dropFirst) {
+        dropFirst = false
+        return { drop: 'blocked' }
+      }
+      return { text: e.text }
+    })
+
+    const dropped = (await $.prompt.submit({
+      text: '被拦截的第一条',
+      wait: false,
+      origin: { kind: 'composer' },
+    })) as { drop?: string }
+    expect(dropped.drop).toBe('blocked')
+
+    await $.prompt.submit({
+      text: '真正通过的第二条',
+      wait: false,
+      origin: { kind: 'composer' },
+    })
+
+    await $.session.append({
+      message: {
+        type: 'attachment',
+        content: [{ type: 'text', text: 'OK' }],
+      },
+      door: 'user',
+      origin: { kind: 'composer' },
+      uuid: 'm-attachment',
+    } as never)
+    await $.session.append({
+      message: {
+        type: 'user',
+        role: 'user',
+        isMeta: true,
+        content: [{ type: 'text', text: 'OK' }],
+      },
+      door: 'user',
+      origin: { kind: 'composer' },
+      uuid: 'm-meta',
+    } as never)
+    await $.session.append({
+      message: {
+        type: 'user',
+        role: 'user',
+        isMeta: false,
+        content: [{ type: 'text', text: 'OK' }],
+      },
+      agentId: 'sub-1',
+      door: 'user',
+      origin: { kind: 'composer' },
+      uuid: 'm-agent',
+    } as never)
+
+    await $.session.append(appendedUserMessage('OK', 'm-real') as never)
+
+    const drawn = await $.ui.render(
+      userMessageInput('OK', { kind: 'composer' }, 'm-real'),
+    )
+    expect(drawnText(drawn)).toBe('真正通过的第二条')
+  },
+)
+
+test(
+  'prompt.submit 跳过 isMeta 与结构化 command 提交，不调用模型',
+  { options: { translateInput: true, inputLanguage: 'en' } },
+  async ($, on) => {
+    const calls = installModel(on, () => translated('should not run'))
+    const received: string[] = []
+    on('prompt.submit', ($, e) => {
+      received.push(e.text)
+      return { text: e.text }
+    })
+
+    await $.prompt.submit({
+      text: '展开后的技能中文提示',
+      wait: false,
+      isMeta: true,
+      origin: { kind: 'composer' },
+    } as never)
+    await $.prompt.submit({
+      text: '结构化命令中文提示',
+      wait: false,
+      command: { name: 'review', args: '' },
+      origin: { kind: 'composer' },
+    } as never)
+
+    expect(calls()).toBe(0)
+    expect(received).toEqual(['展开后的技能中文提示', '结构化命令中文提示'])
+  },
+)
+
+test(
+  'command.run 跳过非用户来源的命令调用',
+  { options: { translateInput: true, inputLanguage: 'en' } },
+  async ($, on) => {
+    const calls = installModel(on, () => translated('should not run'))
+    const seenArgs: string[] = []
+    on('command.run', { command: 'custom:skill' }, ($, e) => {
+      seenArgs.push(e.args)
+      return { text: '' }
+    })
+
+    await $.command.run({
+      ...commandRunInput('custom:skill', '插件传入的中文参数'),
+      origin: { kind: 'plugin', name: 'other' } as never,
+    })
+    await $.command.run({
+      ...commandRunInput('custom:skill', '定时触发的中文参数'),
+      origin: { kind: 'scheduled-trigger' } as never,
+    })
+
+    expect(calls()).toBe(0)
+    expect(seenArgs).toEqual(['插件传入的中文参数', '定时触发的中文参数'])
+  },
+)
+
+test(
+  'UserMessage 缓存 store 未命中避免重绘重复读取，且非用户来源不读 originals',
+  { options: { translateInput: true, inputLanguage: 'en' } },
+  async ($, on) => {
+    registerRenderBottoms(on)
+    let originalReads = 0
+    on('store.get', (_$inner, e) => {
+      if (e.key.startsWith('originals:')) originalReads += 1
+      return { value: undefined }
+    })
+
+    const first = await $.ui.render(
+      userMessageInput('Plain English message', { kind: 'composer' }, 'u-miss'),
+    )
+    const second = await $.ui.render(
+      userMessageInput('Plain English message', { kind: 'composer' }, 'u-miss'),
+    )
+    expect(drawnText(first)).toBe('Plain English message')
+    expect(drawnText(second)).toBe('Plain English message')
+    expect(originalReads).toBe(1)
+
+    const notification = await $.ui.render(
+      userMessageInput(
+        'Task notification text',
+        { kind: 'task-notification' },
+        'u-notify',
+      ),
+    )
+    expect(drawnText(notification)).toBe('Task notification text')
+    expect(originalReads).toBe(1)
+  },
+)
+
+test(
+  'translator-test 输出设置、配置行与 sonnet 回退结果，translator 持久化在修剪后仍失败时提示未持久化',
+  { options: { model: 'haiku', outputLanguage: 'zh' } },
+  async ($, on) => {
+    on('config.list', () => ({
+      value: [
+        { key: 'session-translator.model', value: 'haiku', scope: 'user' },
+        { key: 'other.key', value: 1, scope: 'user' },
+      ] as never,
+    }))
+
+    const models: string[] = []
+    on('model.complete', (_$inner, e) => {
+      models.push(e.model ?? '')
+      if (e.model === 'haiku') {
+        return { value: answered('{"translation":"Hello world"}') }
+      }
+      return { value: answered('{"translation":"你好，世界"}') }
+    })
+
+    let pruneKeysCalls = 0
+    on('store.keys', () => {
+      pruneKeysCalls += 1
+      return { value: ['originals:m-1'] }
+    })
+    on('store.delete', () => ({ value: undefined }))
+    on('store.set', () => ({ deny: 'quota-exceeded' }))
+
+    const testReply = await $.command.run(
+      commandRunInput('translator-test', ''),
+    )
+    expect(models).toEqual(['haiku', 'sonnet'])
+    expect(testReply.text).toContain('model=haiku')
+    expect(testReply.text).toContain('session-translator.model="haiku"')
+    expect(testReply.text).not.toContain('other.key')
+    expect(testReply.text).toContain('model: haiku')
+    expect(testReply.text).toContain('sonnet: {"translation":"你好，世界"}')
+
+    const updateReply = await $.command.run(
+      commandRunInput('translator', 'output ja'),
+    )
+    expect(pruneKeysCalls).toBe(1)
+    expect(updateReply.text).toContain('已更新：outputLanguage=ja')
+    expect(updateReply.text).toContain('（本次生效，未能持久化）')
+  },
+)
+
+test(
+  'session.start 在 store 无 settings 时回退到 initialOptions 并清理旧版 cache 键',
+  { options: { outputLanguage: 'zh', model: 'haiku' } },
+  async ($, on) => {
+    const store = new Map<string, unknown>([
+      ['cache', { old: { status: 'translated', text: '旧整表缓存' } }],
+    ])
+    const deleted: string[] = []
+    on('store.get', (_$inner, e) => ({ value: store.get(e.key) }))
+    on('store.keys', () => ({ value: [...store.keys()] }))
+    on('store.delete', (_$inner, e) => {
+      deleted.push(e.key)
+      store.delete(e.key)
+      return { value: undefined }
+    })
+    on('store.set', () => ({ deny: 'read-only' }))
+    on('session.start', (_$inner, e) => e)
+
+    const switched = await $.command.run(
+      commandRunInput('translator', 'output ja'),
+    )
+    expect(switched.text).toContain('outputLanguage=ja')
+
+    await $.session.start(sessionStartInput('.'))
+
+    const status = await $.command.run(commandRunInput('translator', 'status'))
+    expect(status.text).toContain('outputLanguage=zh')
+    expect(deleted).toContain('cache')
+    expect(store.has('cache')).toBe(false)
+  },
+)
+
+test(
+  '内存缓存淘汰后即使 store 写入失败也不重复调用模型重译',
+  { options: { translateOutput: true, outputLanguage: 'zh' } },
+  async ($, on) => {
+    const clock = mock.clock(on)
+    registerRenderBottoms(on)
+    on('store.get', () => ({ value: undefined }))
+    on('store.keys', () => ({ value: [] }))
+    on('store.set', () => ({ deny: 'disk-full' }))
+
+    const bigTranslation = '译'.repeat(95_000)
+    const calls = installModel(on, () => translated(bigTranslation))
+    const source = (index: number) => `Reply ${index} with a long translation.`
+
+    for (let index = 0; index < 11; index += 1) {
+      await $.ui.render(assistantInput(source(index)))
+    }
+    await clock.advance(1)
+    await clock.settle()
+    expect(calls()).toBe(11)
+
+    await clock.advance(1000)
+    await clock.settle()
+    const rerendered = await $.ui.render(assistantInput(source(0)))
+    expect(drawnText(rerendered)).toBe(bigTranslation)
+    await clock.advance(1)
+    await clock.settle()
+    expect(calls()).toBe(11)
+  },
+)
+
+test('rememberPersistedEntry 与 rememberOriginal 更新已有键时刷新淘汰顺序', {}, async () => {
+  const state = createStorageState()
+  rememberPersistedEntry(state, 'k-0', null)
+  for (let index = 1; index < 300; index += 1) {
+    rememberPersistedEntry(state, `k-${index}`, null)
+  }
+  rememberPersistedEntry(state, 'k-0', { status: 'translated', text: '新译文' })
+  rememberPersistedEntry(state, 'k-300', null)
+  expect(state.persistedEntries.has('k-0')).toBe(true)
+  expect(state.persistedEntries.has('k-1')).toBe(false)
+
+  for (let index = 0; index < 2000; index += 1) {
+    rememberOriginal(state, `m-${index}`, null)
+  }
+  rememberOriginal(state, 'm-0', '找回的原文')
+  expect(state.loadedOriginals.size).toBe(2000)
+  expect(state.loadedOriginals.has('m-1')).toBe(true)
+  rememberOriginal(state, 'm-2000', '新原文')
+  expect(state.loadedOriginals.get('m-0')).toBe('找回的原文')
+  expect(state.loadedOriginals.has('m-1')).toBe(false)
+})

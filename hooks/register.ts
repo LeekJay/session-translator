@@ -1,4 +1,3 @@
-import { atom, read, update } from 'claude-code'
 import type { EngineInterface, On, Register, RenderElement } from 'claude-code'
 import type {
   TranslationCache,
@@ -6,6 +5,7 @@ import type {
   TranslationLanguage,
 } from '../types'
 import { isUsableTranslation, languageName } from './languages'
+import { PLACEHOLDER_PATTERN, protectText } from './protect'
 import {
   QUESTIONS_JSON_RETRY_PROMPT,
   QUESTIONS_PROMPT_TAG,
@@ -24,6 +24,7 @@ import {
   cacheKey,
   describeError,
   finalizeTranslation,
+  formatUnanswered,
   isSlashCommand,
   isTransientFailure,
   prepareTranslation,
@@ -40,6 +41,7 @@ import {
   excessCacheKeys,
   excessOriginalKeys,
   parseLegacyOriginals,
+  pruneStoreOnOverflow,
   readPersistedEntry,
   recheckPersistedEntry,
   rememberOriginal,
@@ -52,7 +54,6 @@ import {
 } from './storage'
 import type { StorageState } from './storage'
 import {
-  SETTING_KEYS,
   SKIP_COMMAND_ARGS_TRANSLATION,
   TRANSLATOR_TEST_PROMPT,
   applyStoredSettings,
@@ -68,21 +69,8 @@ import {
 } from './commands'
 import type { Options, RuntimeConfig } from './commands'
 
-export type { Options }
-export {
-  SETTING_KEYS,
-  applyStoredSettings,
-  settingsPayload,
-  describeSettings,
-  isSlashCommand,
-}
-
-const cache = atom(
-  { plugin: 'session-translator', key: 'cache' } as const,
-  {},
-)
-
 const MAX_INPUT_LENGTH = 20_000
+const MAX_PENDING_PERSIST_ENTRIES = 300
 
 // 对话框里超过这个长度的文本是问题/说明，必须真的翻成目标语言。
 const LONG_DIALOG_TEXT_LENGTH = 20
@@ -115,8 +103,6 @@ async function translateInputWithRetry(
   return entry
 }
 
-const defaultPending = new Set<string>()
-
 type PendingInput = {
   readonly translated: string
   readonly original: string
@@ -133,7 +119,7 @@ export function scheduleTranslation(
   schedule: Schedule,
   key: string,
   start: () => void,
-  pendingSet: Set<string> = defaultPending,
+  pendingSet: Set<string>,
 ): ScheduleResult {
   if (pendingSet.has(key)) return 'busy'
   pendingSet.add(key)
@@ -192,10 +178,7 @@ async function translate(
       effort: 'low',
     })
     if (!result.isAnswered) {
-      return {
-        status: 'failed',
-        reason: `${result.reason} (out=${result.usage.output_tokens}, in=${result.usage.input_tokens})`,
-      }
+      return { status: 'failed', reason: formatUnanswered(result) }
     }
     const entry = finalizeTranslation(prepared, result)
     if (entry.status === 'translated') return entry
@@ -210,10 +193,7 @@ async function translate(
       effort: 'low',
     })
     if (!retry.isAnswered) {
-      return {
-        status: 'failed',
-        reason: `${retry.reason} (out=${retry.usage.output_tokens}, in=${retry.usage.input_tokens})`,
-      }
+      return { status: 'failed', reason: formatUnanswered(retry) }
     }
     return finalizeTranslation(prepared, retry)
   } catch (error) {
@@ -240,10 +220,7 @@ async function translateQuestions(
       effort: 'low',
     })
     if (!result.isAnswered) {
-      return {
-        status: 'failed',
-        reason: `${result.reason} (out=${result.usage.output_tokens}, in=${result.usage.input_tokens})`,
-      }
+      return { status: 'failed', reason: formatUnanswered(result) }
     }
 
     let translations = parseQuestionsResponse(result.text)
@@ -257,10 +234,7 @@ async function translateQuestions(
         effort: 'low',
       })
       if (!retry.isAnswered) {
-        return {
-          status: 'failed',
-          reason: `${retry.reason} (out=${retry.usage.output_tokens}, in=${retry.usage.input_tokens})`,
-        }
+        return { status: 'failed', reason: formatUnanswered(retry) }
       }
       translations = parseQuestionsResponse(retry.text)
       if (
@@ -275,8 +249,16 @@ async function translateQuestions(
     for (let index = 0; index < translations.length; index += 1) {
       const source = item.texts[index]!
       if (source.length <= LONG_DIALOG_TEXT_LENGTH) continue
+      if (!shouldTranslate(source, item.target)) continue
+      const sourceProseLength = protectText(source)
+        .text.replace(PLACEHOLDER_PATTERN, ' ')
+        .trim().length
       if (
-        !isUsableTranslation(translations[index]!, item.target, source.length)
+        !isUsableTranslation(
+          translations[index]!,
+          item.target,
+          sourceProseLength,
+        )
       ) {
         return { status: 'failed', reason: 'wrong-language' }
       }
@@ -307,9 +289,7 @@ async function translateFreeTextAnswers(
   const map = new Map<string, string>()
   if (texts.length === 0) return map
 
-  const pendingTexts = texts.filter(text =>
-    shouldTranslate(text, target, translationRules),
-  )
+  const pendingTexts = texts.filter(text => shouldTranslate(text, target))
   if (pendingTexts.length === 0) return map
 
   try {
@@ -351,21 +331,22 @@ function schedulePersist($: EngineInterface, storage: StorageState): void {
     $.clock.after(PERSIST_DELAY_MS, async () => {
       storage.persistScheduled = false
 
-      let entries: TranslationCache
-      try {
-        entries = await read($, cache)
-      } catch (error) {
-        const reason = describeError(error)
-        safeLog($, `翻译缓存持久化失败：${reason}`)
-        return
+      const entries: TranslationCache = {
+        ...Object.fromEntries(storage.pendingPersist),
+        ...storage.cache,
       }
+      storage.pendingPersist.clear()
+      retainPersistedKeys(storage.persistedKeys, storage.cache)
 
-      // 原子缓存已经淘汰的 key 不会再被遍历，从去重集合里忘掉，避免长会话无界增长。
-      retainPersistedKeys(storage.persistedKeys, entries)
-
+      let hadFailure = false
       for (const [key, entry] of Object.entries(entries)) {
         if (entry.status !== 'translated') continue
-        if (storage.persistedKeys.has(key)) continue
+        if (
+          storage.persistedKeys.has(key) ||
+          storage.unpersistableKeys.has(key)
+        ) {
+          continue
+        }
         const textLength = entry.text.length
         try {
           // 正文和大小标记分两次写：任一次失败都不记为已写，下次持久化重试。
@@ -380,9 +361,40 @@ function schedulePersist($: EngineInterface, storage: StorageState): void {
           rememberPersistedEntry(storage, key, entry)
         } catch (error) {
           // 单条失败不影响其他条目；不记为已写，下次持久化再试。
+          hadFailure = true
+          if (!storage.unpersistableKeys.has(key)) {
+            if (
+              !storage.pendingPersist.has(key) &&
+              storage.pendingPersist.size >= MAX_PENDING_PERSIST_ENTRIES
+            ) {
+              const oldest = storage.pendingPersist.keys().next().value
+              if (oldest !== undefined) {
+                const dropped = storage.pendingPersist.get(oldest)
+                storage.pendingPersist.delete(oldest)
+                if (
+                  storage.unpersistableKeys.size >= MAX_PENDING_PERSIST_ENTRIES
+                ) {
+                  const oldestUnpersistable =
+                    storage.unpersistableKeys.values().next().value
+                  if (oldestUnpersistable !== undefined) {
+                    storage.unpersistableKeys.delete(oldestUnpersistable)
+                  }
+                }
+                storage.unpersistableKeys.add(oldest)
+                if (dropped !== undefined) {
+                  rememberPersistedEntry(storage, oldest, dropped)
+                }
+              }
+            }
+            storage.pendingPersist.set(key, entry)
+          }
           const reason = describeError(error)
           safeLog($, `翻译缓存持久化失败：${reason}`)
         }
+      }
+
+      if (hadFailure) {
+        await pruneStoreOnOverflow($)
       }
     })
   } catch {
@@ -396,9 +408,10 @@ async function loadOriginalForMessage(
   messageId: string,
 ): Promise<string | undefined> {
   const cached = storage.loadedOriginals.get(messageId)
-  if (cached !== undefined) return cached
+  if (cached !== undefined) return cached ?? undefined
 
   let original: string | undefined
+  let readFailed = false
   try {
     const value = await $.store.get(storedOriginalKey(messageId))
     if (typeof value === 'string') {
@@ -406,12 +419,16 @@ async function loadOriginalForMessage(
     }
   } catch {
     // store 读失败时尝试回退到旧版整表。
+    readFailed = true
   }
 
   if (original === undefined) {
     original = storage.legacyOriginals[messageId]
   }
-  if (original === undefined) return undefined
+  if (original === undefined) {
+    if (!readFailed) rememberOriginal(storage, messageId, null)
+    return undefined
+  }
 
   rememberOriginal(storage, messageId, original)
   return original
@@ -426,9 +443,14 @@ async function saveOriginalForMessage(
   rememberOriginal(storage, messageId, original)
   try {
     await $.store.set(storedOriginalKey(messageId), original)
-  } catch (error) {
-    const reason = describeError(error)
-    safeLog($, `原文映射持久化失败：${reason}`)
+  } catch {
+    try {
+      await pruneStoreOnOverflow($)
+      await $.store.set(storedOriginalKey(messageId), original)
+    } catch (error) {
+      const reason = describeError(error)
+      safeLog($, `原文映射持久化失败：${reason}`)
+    }
   }
 }
 
@@ -439,6 +461,18 @@ async function configRowsText($: EngineInterface): Promise<string> {
     const reason = describeError(error)
     return `config rows: unavailable (${reason})`
   }
+}
+
+async function lookupCacheEntry(
+  $: EngineInterface,
+  storage: StorageState,
+  key: string,
+): Promise<TranslationCacheEntry | undefined> {
+  const cachedEntry = storage.cache[key] ?? storage.pendingPersist.get(key)
+  if (cachedEntry?.status === 'failed') {
+    return (await recheckPersistedEntry($, storage, key)) ?? cachedEntry
+  }
+  return cachedEntry ?? (await readPersistedEntry($, storage, key))
 }
 
 async function commit(
@@ -460,8 +494,17 @@ async function commit(
       }
     }
 
-    await update($, cache, current => pruneCache({ ...current, [key]: entry }))
-    if (entry.status === 'translated') schedulePersist($, storage)
+    storage.cache = pruneCache({ ...storage.cache, [key]: entry })
+    if (entry.status === 'translated') {
+      storage.pendingPersist.set(key, entry)
+      schedulePersist($, storage)
+    }
+    try {
+      await $.state.set(
+        { plugin: 'session-translator', key: 'cache', id: key },
+        1,
+      )
+    } catch {}
   } catch (error) {
     const reason = describeError(error)
     safeLog($, `${label}翻译未写入缓存：${reason}`)
@@ -536,18 +579,19 @@ export const register: Register = (on, options) => {
 }
 
 function setupSessionStart(on: On, context: RegisterContext): void {
-  const { runtime, storage } = context
+  const { initialOptions, pendingInputs, runtime, storage } = context
 
   on('session.start', async ($, e, next) => {
     try {
       const saved = await $.store.get('settings')
-      const stored = applyStoredSettings(runtime.config, saved)
+      const stored = applyStoredSettings(initialOptions, saved)
       runtime.config = stored
       runtime.signature = signatureOf(stored)
     } catch {
       // 读取失败时沿用当前设置。
     }
 
+    pendingInputs.length = 0
     resetPersistedCacheState(storage)
 
     storage.loadedOriginals.clear()
@@ -653,7 +697,12 @@ function setupCommands(on: On, context: RegisterContext): void {
         if (action.kind === 'reset') {
           await $.store.delete('settings')
         } else {
-          await $.store.set('settings', settingsPayload(action.next))
+          try {
+            await $.store.set('settings', settingsPayload(action.next))
+          } catch {
+            await pruneStoreOnOverflow($)
+            await $.store.set('settings', settingsPayload(action.next))
+          }
         }
         return { text: action.reply }
       } catch {
@@ -679,17 +728,13 @@ function setupCommands(on: On, context: RegisterContext): void {
   // 斜杠命令在 prompt.submit 阶段改写不会生效；改在这里翻译其参数。
   on('command.run', async ($, e, next) => {
     if (!runtime.config.translateInput) return next(e)
+    const originKind = e.origin?.kind ?? 'unclassified'
+    if (!TRANSLATABLE_ORIGINS.has(originKind)) return next(e)
     if (SKIP_COMMAND_ARGS_TRANSLATION.has(e.command)) return next(e)
     if (e.args.trim().length === 0) return next(e)
     // 纯机器参数（例如 `5m /review`、`--fix`）翻任何一个 token 都可能改坏命令。
     if (looksLikeMachineArgs(e.args)) return next(e)
-    if (
-      !shouldTranslate(
-        e.args,
-        runtime.config.inputLanguage,
-        runtime.config.translationRules,
-      )
-    ) {
+    if (!shouldTranslate(e.args, runtime.config.inputLanguage)) {
       return next(e)
     }
     if (e.args.length > MAX_INPUT_LENGTH) {
@@ -723,15 +768,10 @@ function setupInputTranslation(on: On, context: RegisterContext): void {
 
     const originKind = e.origin?.kind ?? 'unclassified'
     if (!TRANSLATABLE_ORIGINS.has(originKind)) return next(e)
+    if (e.isMeta || e.command !== undefined) return next(e)
     // 宿主会忽略 prompt.submit 对斜杠命令的改写并发出警告，命令参数改由 command.run 处理。
     if (isSlashCommand(e.text)) return next(e)
-    if (
-      !shouldTranslate(
-        e.text,
-        runtime.config.inputLanguage,
-        runtime.config.translationRules,
-      )
-    ) {
+    if (!shouldTranslate(e.text, runtime.config.inputLanguage)) {
       return next(e)
     }
     // 这段文本本该翻译，放行原文会把它交给主模型，违背替换模式；只能丢弃。
@@ -749,9 +789,24 @@ function setupInputTranslation(on: On, context: RegisterContext): void {
         return { drop: `提示翻译失败，原文已放回输入框：${entry.reason}` }
       }
 
-      pendingInputs.push({ translated: entry.text, original: e.text })
+      const pendingItem: PendingInput = {
+        translated: entry.text,
+        original: e.text,
+      }
+      pendingInputs.push(pendingItem)
       if (pendingInputs.length > MAX_PENDING_INPUTS) pendingInputs.shift()
-      return next({ ...e, text: entry.text })
+      try {
+        const submitted = await next({ ...e, text: entry.text })
+        if ('drop' in submitted && submitted.drop !== undefined) {
+          const index = pendingInputs.indexOf(pendingItem)
+          if (index !== -1) pendingInputs.splice(index, 1)
+        }
+        return submitted
+      } catch (error) {
+        const index = pendingInputs.indexOf(pendingItem)
+        if (index !== -1) pendingInputs.splice(index, 1)
+        throw error
+      }
     } finally {
       safeStatus($, undefined)
     }
@@ -764,6 +819,13 @@ function setupInputTranslation(on: On, context: RegisterContext): void {
   // 再绑定到这条消息的 uuid；查看时按同一个 ID 显示原文。
   on('session.append', async ($, e, next) => {
     try {
+      if (
+        e.message.type !== 'user' ||
+        e.message.isMeta === true ||
+        e.agentId !== undefined
+      ) {
+        return next(e)
+      }
       const originKind = e.origin?.kind ?? 'unclassified'
       if (!TRANSLATABLE_ORIGINS.has(originKind)) return next(e)
 
@@ -812,13 +874,7 @@ function setupOutputRender(on: On, context: RegisterContext): void {
       const signature = runtime.signature
       if (config.translateOutput) {
         const source = e.props.text
-        if (
-          shouldTranslate(
-            source,
-            config.outputLanguage,
-            config.translationRules,
-          )
-        ) {
+        if (shouldTranslate(source, config.outputLanguage)) {
           const item: PendingTranslation = {
             key: cacheKey(signature, config.outputLanguage, 'output', source),
             text: source,
@@ -826,15 +882,14 @@ function setupOutputRender(on: On, context: RegisterContext): void {
             translationRules: config.translationRules,
             model: config.model,
           }
-          const entries = await read($, cache)
-          const cachedEntry = entries[item.key]
+          await $.state.get({
+            plugin: 'session-translator',
+            key: 'cache',
+            id: item.key,
+          })
           // 失败条目可能只是本会话的失败：其他会话也许已经用同一个 key
           // 翻译成功并持久化，重查一次 store；查不到仍保留失败条目，抑制重译。
-          const entry =
-            cachedEntry?.status === 'failed'
-              ? (await recheckPersistedEntry($, storage, item.key)) ?? cachedEntry
-              : cachedEntry ??
-                (await readPersistedEntry($, storage, item.key))
+          const entry = await lookupCacheEntry($, storage, item.key)
 
           if (entry?.status === 'translated') {
             rewritten = fitTables(entry.text, e.viewport?.columns)
@@ -871,6 +926,9 @@ function setupOutputRender(on: On, context: RegisterContext): void {
   // 查看时按它把原文换回来。直接读会话文件的工具仍会看到译文。
   on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
     try {
+      const originKind = e.props.origin?.kind ?? 'unclassified'
+      if (!TRANSLATABLE_ORIGINS.has(originKind)) return next(e)
+
       const messageId = e.requestId
       if (typeof messageId !== 'string') return next(e)
 
@@ -903,11 +961,7 @@ function setupQuestions(on: On, context: RegisterContext): void {
 
         if (
           texts.length > 0 &&
-          shouldTranslate(
-            texts.join('\n'),
-            config.outputLanguage,
-            config.translationRules,
-          )
+          shouldTranslate(texts.join('\n'), config.outputLanguage)
         ) {
           const key = questionsCacheKey(
             signature,
@@ -915,14 +969,8 @@ function setupQuestions(on: On, context: RegisterContext): void {
             QUESTIONS_PROMPT_TAG,
             texts,
           )
-          const entries = await read($, cache)
-          const cachedEntry = entries[key]
           // 与助手回复相同：本会话的失败条目不该永久挡住其他会话的译文。
-          let entry =
-            cachedEntry?.status === 'failed'
-              ? (await recheckPersistedEntry($, storage, key)) ?? cachedEntry
-              : cachedEntry ??
-                (await readPersistedEntry($, storage, key))
+          let entry = await lookupCacheEntry($, storage, key)
 
           if (entry === undefined && !pending.has(key)) {
             pending.add(key)
@@ -939,14 +987,7 @@ function setupQuestions(on: On, context: RegisterContext): void {
               throw error
             }
 
-            try {
-              $.clock.after(1, () =>
-                commit($, storage, pending, key, '选择项', async () => entry!),
-              )
-            } catch {
-              pending.delete(key)
-              // 没有时钟的宿主仍然能显示这次译文，只是不缓存。
-            }
+            await commit($, storage, pending, key, '选择项', async () => entry!)
           }
 
           if (entry?.status === 'translated') {
@@ -1034,13 +1075,7 @@ function setupGoal(on: On, context: RegisterContext): void {
 
       const condition = goalConditionOf(text)
       if (condition === undefined) return next(e)
-      if (
-        !shouldTranslate(
-          condition,
-          runtime.config.inputLanguage,
-          runtime.config.translationRules,
-        )
-      ) {
+      if (!shouldTranslate(condition, runtime.config.inputLanguage)) {
         return next(e)
       }
 

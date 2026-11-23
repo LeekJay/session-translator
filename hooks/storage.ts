@@ -10,30 +10,34 @@ export const PERSIST_DELAY_MS = 1000
 
 // 每条译文单独占一个 key：多个会话共用一个 store 时，各自只写自己刚翻的那条，
 // 不会像整表回写那样把并发会话写入的条目覆盖掉。
-export const CACHE_ENTRY_KEY_PREFIX = 'cache-entry:'
+const CACHE_ENTRY_KEY_PREFIX = 'cache-entry:'
 
 // 每条译文再配一个大小标记，字符数直接写进 key 名：
 // cache-entry-size:<textLength>:<cacheKey>。会话启动修剪时只列一次 keys()，
 // 不用逐条读取译文正文就能按总字符数淘汰。
-export const CACHE_ENTRY_SIZE_KEY_PREFIX = 'cache-entry-size:'
+const CACHE_ENTRY_SIZE_KEY_PREFIX = 'cache-entry-size:'
 
 // 每条原文单独占一个 key：多个会话共用一个 store 时，各自只写自己那条消息，
 // 不会像整表回写那样互相覆盖丢数据。
-export const ORIGINALS_KEY_PREFIX = 'originals:'
-export const MAX_ORIGINAL_PROMPTS = 2000
+const ORIGINALS_KEY_PREFIX = 'originals:'
+const MAX_ORIGINAL_PROMPTS = 2000
 
 // 会话开始时只读取旧版整表 'originals' 键并修剪超出上限的逐条键；
 // 逐条键改为在 UserMessage 渲染时按需懒加载，避免启动时批量读取阻塞。
 // 旧版本把原文存成一个整表 'originals' 键；升级后仍读它，否则旧会话
 // --resume 后原文全部丢失。新格式的逐条键优先级更高。
 export const LEGACY_ORIGINALS_KEY = 'originals'
+export const LEGACY_CACHE_KEY = 'cache'
 
 export type StorageState = {
+  cache: TranslationCache
   legacyOriginals: OriginalPrompts
-  readonly loadedOriginals: Map<string, string>
+  readonly loadedOriginals: Map<string, string | null>
   persistScheduled: boolean
+  readonly pendingPersist: Map<string, TranslationCacheEntry>
   // 本会话已经成功写进 store 的译文 key，避免每次持久化都重写一遍。
   readonly persistedKeys: Set<string>
+  readonly unpersistableKeys: Set<string>
   // 跨会话译文按需读取的结果：命中的条目，或已确认的缺失（null）。
   // 没读过的 key 不在表里；读失败也不记，下次渲染可以重试。
   readonly persistedEntries: Map<string, TranslationCacheEntry | null>
@@ -41,10 +45,13 @@ export type StorageState = {
 
 export function createStorageState(): StorageState {
   return {
+    cache: {},
     legacyOriginals: {},
-    loadedOriginals: new Map<string, string>(),
+    loadedOriginals: new Map<string, string | null>(),
     persistScheduled: false,
+    pendingPersist: new Map<string, TranslationCacheEntry>(),
     persistedKeys: new Set<string>(),
+    unpersistableKeys: new Set<string>(),
     persistedEntries: new Map<string, TranslationCacheEntry | null>(),
   }
 }
@@ -150,6 +157,9 @@ export function excessCacheKeys(keys: readonly string[]): string[] {
   const keptEntryKeys = new Set(entryKeys.slice(dropCount))
 
   const deleteKeys = new Set(entryKeys.slice(0, dropCount))
+  if (keys.includes(LEGACY_CACHE_KEY)) {
+    deleteKeys.add(LEGACY_CACHE_KEY)
+  }
   for (const [entryKey, markers] of sizes.markersByEntryKey) {
     const entryStoreKey = storedCacheEntryKey(entryKey)
     if (!entryKeySet.has(entryStoreKey)) {
@@ -177,22 +187,74 @@ export function excessCacheKeys(keys: readonly string[]): string[] {
   return keys.filter(key => deleteKeys.has(key))
 }
 
+export async function pruneStoreOnOverflow($: EngineInterface): Promise<void> {
+  let keys: readonly string[]
+  try {
+    keys = await $.store.keys()
+  } catch {
+    return
+  }
+
+  const toDelete = new Set<string>([
+    ...excessOriginalKeys(keys),
+    ...excessCacheKeys(keys),
+  ])
+
+  const remainingOriginals = keys.filter(
+    key => key.startsWith(ORIGINALS_KEY_PREFIX) && !toDelete.has(key),
+  )
+  if (remainingOriginals.length > 0) {
+    const count = Math.max(1, Math.ceil(remainingOriginals.length * 0.25))
+    for (const key of remainingOriginals.slice(0, count)) {
+      toDelete.add(key)
+    }
+  }
+
+  const remainingCacheEntries = keys.filter(
+    key => key.startsWith(CACHE_ENTRY_KEY_PREFIX) && !toDelete.has(key),
+  )
+  if (remainingCacheEntries.length > 0) {
+    const count = Math.max(1, Math.ceil(remainingCacheEntries.length * 0.25))
+    const sizes = indexCacheEntrySizes(keys)
+    for (const key of remainingCacheEntries.slice(0, count)) {
+      toDelete.add(key)
+      const entryKey = key.slice(CACHE_ENTRY_KEY_PREFIX.length)
+      const markers = sizes.markersByEntryKey.get(entryKey)
+      if (markers !== undefined) {
+        for (const marker of markers) toDelete.add(marker.key)
+      }
+    }
+  }
+
+  for (const key of toDelete) {
+    try {
+      await $.store.delete(key)
+    } catch {}
+  }
+}
+
 export function rememberOriginal(
   state: StorageState,
   messageId: string,
-  original: string,
+  original: string | null,
 ): void {
-  if (state.loadedOriginals.size >= MAX_ORIGINAL_PROMPTS) {
+  if (
+    !state.loadedOriginals.has(messageId) &&
+    state.loadedOriginals.size >= MAX_ORIGINAL_PROMPTS
+  ) {
     const oldest = state.loadedOriginals.keys().next().value
     if (oldest !== undefined) state.loadedOriginals.delete(oldest)
   }
+  state.loadedOriginals.delete(messageId)
   state.loadedOriginals.set(messageId, original)
 }
 
 // 新会话开始：本次已写记录和跨会话读取结果都不再代表 store 的现状。
 export function resetPersistedCacheState(state: StorageState): void {
   state.persistedKeys.clear()
+  state.unpersistableKeys.clear()
   state.persistedEntries.clear()
+  state.pendingPersist.clear()
 }
 
 // 原子缓存淘汰掉的 key 不会再被持久化遍历，去重集合里留着只会随会话无界增长。
@@ -215,6 +277,7 @@ export function rememberPersistedEntry(
   entryKey: string,
   entry: TranslationCacheEntry | null,
 ): void {
+  state.persistedEntries.delete(entryKey)
   state.persistedEntries.set(entryKey, entry)
 
   const keys = [...state.persistedEntries.keys()]

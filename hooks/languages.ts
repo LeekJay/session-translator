@@ -9,7 +9,7 @@ const LANGUAGE_NAMES: Record<TranslationLanguage, string> = {
   de: 'German',
 }
 
-export const TRANSLATION_LANGUAGES: readonly TranslationLanguage[] = [
+const TRANSLATION_LANGUAGES: readonly TranslationLanguage[] = [
   'en',
   'zh',
   'ja',
@@ -30,7 +30,7 @@ export function isTranslationLanguage(
   )
 }
 
-const KANA = /[぀-ヿㇰ-ㇿ･-ﾟ]/
+const KANA = /^[\p{Script=Hiragana}\p{Script=Katakana}]$/u
 const HAN = /^\p{Script=Han}$/u
 const LATIN = /^\p{Script=Latin}$/u
 

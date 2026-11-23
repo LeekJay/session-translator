@@ -548,7 +548,7 @@ export function freeTextAnswers(
       if (notes !== undefined) pushNote(notes)
     }
   }
-  push(result.response, maps.labels, 'split')
+  pushNote(result.response)
 
   return texts
 }
@@ -626,7 +626,7 @@ export function translateAnswers(
   }
 
   if (typeof result.response === 'string') {
-    out.response = restoreValue(result.response, maps.labels, 'split')
+    out.response = restoreNote(result.response)
   }
 
   return out

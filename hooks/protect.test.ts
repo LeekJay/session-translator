@@ -64,6 +64,12 @@ const CASES: readonly ProtectionCase[] = [
     protectedText: '改 @@ST_KEEP_1@@ 文件。',
   },
   {
+    name: '无前缀相对路径',
+    text: '改 src/services/authentication.ts 文件。',
+    fragment: 'src/services/authentication.ts',
+    protectedText: '改 @@ST_KEEP_1@@ 文件。',
+  },
+  {
     name: 'snake_case 标识符',
     text: '把 user_name 传进去。',
     fragment: 'user_name',
@@ -168,4 +174,35 @@ test('普通文字与受保护片段并存时仍有可翻译正文', {}, async (
   for (const input of inputs) {
     expect(hasTranslatableProse(protectText(input).text)).toBe(true)
   }
+})
+
+test('含行内三反引号字符串的两个代码围栏不会把中间正文吞进占位符', {}, async () => {
+  const first = '```ts\nconst s = "```"\n```'
+  const second = '```ts\nconst t = 1\n```'
+  const text = `${first}\nThen update the config.\n${second}`
+  const protectedText = protectText(text)
+
+  expect(protectedText.text).toBe(
+    '@@ST_KEEP_1@@\nThen update the config.\n@@ST_KEEP_2@@',
+  )
+  expect(protectedText.values).toEqual([first, second])
+  expect(restoreText(protectedText.text, protectedText.values)).toBe(text)
+})
+
+test('四反引号围栏包裹三反引号代码块时合并为单个占位符', {}, async () => {
+  const fenced = '````md\n```ts\nconst x = 1\n```\n````'
+  const text = `示例：\n${fenced}\n结束。`
+  const protectedText = protectText(text)
+
+  expect(protectedText.text).toBe('示例：\n@@ST_KEEP_1@@\n结束。')
+  expect(protectedText.values).toEqual([fenced])
+  expect(restoreText(protectedText.text, protectedText.values)).toBe(text)
+})
+
+test('小于号与箭头共现的普通正文不会被误判为 HTML 标签', {}, async () => {
+  const text = 'When i<n, each step updates the cache -> total time is O(n).'
+  const protectedText = protectText(text)
+
+  expect(protectedText.text).toBe(text)
+  expect(protectedText.values).toEqual([])
 })

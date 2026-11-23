@@ -8,17 +8,25 @@ type Range = { start: number; end: number }
 type Pattern = { pattern: RegExp; group: number }
 
 const PATTERNS: readonly Pattern[] = [
-  { pattern: /(```|~~~)[\s\S]*?\1/g, group: 0 },
+  {
+    pattern: /(?<![`~])(`{3,}|~{3,})(?![`~])[\s\S]*?\n[^\S\n]*\1(?![`~])/g,
+    group: 0,
+  },
   // 反引号必须成对且长度相同。否则围栏结尾的第三个反引号会被当成
   // 行内代码起点，把围栏与后面行内代码之间的正文一起吞进受保护片段。
   { pattern: /(?<!`)(`+)(?!`)[^`\n]+?\1(?!`)/g, group: 0 },
-  { pattern: /<\/?[A-Za-z][^>]*>/g, group: 0 },
+  { pattern: /<\/?[A-Za-z][A-Za-z0-9-]*(?:\s[^>\n]*)?\/?>/g, group: 0 },
   { pattern: /\{\{[\s\S]*?\}\}/g, group: 0 },
   { pattern: /\$\{[^{}]*\}/g, group: 0 },
   { pattern: /https?:\/\/[^\s"'`<>]+/g, group: 0 },
   { pattern: /[A-Za-z]:\\[^\s"'`<>()[\]{}|]+/g, group: 0 },
   { pattern: /(^|[\s(\[{"'`=,;])(\/[^\s"'`<>()[\]{}]+)/g, group: 2 },
   { pattern: /(^|[\s(\[{"'`=,;])(\.\.?\/[^\s"'`<>()[\]{}]+)/g, group: 2 },
+  {
+    pattern:
+      /(^|[\s(\[{"'`=,;])([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+\.[A-Za-z0-9]+)/g,
+    group: 2,
+  },
   { pattern: /\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\b/g, group: 0 },
   { pattern: /\b[a-z][A-Za-z0-9]*[A-Z][A-Za-z0-9]*\b/g, group: 0 },
   { pattern: /\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+\b/g, group: 0 },
@@ -71,18 +79,18 @@ export function protectText(text: string): ProtectedText {
   }
 
   const values: string[] = []
-  let result = text
-  for (let index = merged.length - 1; index >= 0; index -= 1) {
+  const parts: string[] = []
+  let cursor = 0
+  for (let index = 0; index < merged.length; index += 1) {
     const range = merged[index]
     if (range === undefined) continue
-    values[index] = text.slice(range.start, range.end)
-    result =
-      result.slice(0, range.start) +
-      placeholder(index + 1) +
-      result.slice(range.end)
+    parts.push(text.slice(cursor, range.start), placeholder(index + 1))
+    values.push(text.slice(range.start, range.end))
+    cursor = range.end
   }
+  parts.push(text.slice(cursor))
 
-  return { text: result, values }
+  return { text: parts.join(''), values }
 }
 
 export function restoreText(

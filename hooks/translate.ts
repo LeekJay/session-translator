@@ -14,7 +14,7 @@ import {
 import type { TranslationKind } from './prompt'
 import { buildTranslationRequest, parseTranslationResponse } from './prompt'
 
-export const MAX_CACHE_ENTRIES = 300
+const MAX_CACHE_ENTRIES = 300
 
 // 条目数之外再加总字符上限：一条助手回复可能上万字符，300 条长回复会让
 // 插件内存和 store 达到数 MB。约 100 万字符（UTF-16 下约 2 MB）足够复用，
@@ -23,14 +23,31 @@ export const MAX_CACHE_CHARS = 1_000_000
 
 // 瞬时失败和可重试的解析失败都不写缓存：下一次遇到同样的文本会重新请求模型。
 const TRANSIENT_FAILURES: readonly string[] = [
-  'api-error',
+  'api-error:rate_limit',
+  'api-error:overloaded',
+  'api-error:server_error',
+  'api-error:unknown',
+  'api-error ',
   'empty-reply',
   'aborted',
   'unusable-questions',
 ]
 
 export function isTransientFailure(reason: string): boolean {
-  return TRANSIENT_FAILURES.some(prefix => reason.startsWith(prefix))
+  return (
+    reason === 'api-error' ||
+    TRANSIENT_FAILURES.some(prefix => reason.startsWith(prefix))
+  )
+}
+
+export function formatUnanswered(
+  result: Exclude<ModelCompleteResult, { isAnswered: true }>,
+): string {
+  const usage = `(out=${result.usage.output_tokens}, in=${result.usage.input_tokens})`
+  if (result.reason === 'api-error') {
+    return `api-error:${result.error} (status=${result.status ?? 'none'}, ${usage.slice(1)}`
+  }
+  return `${result.reason} ${usage}`
 }
 
 export type PreparedTranslation = {
@@ -195,8 +212,6 @@ function looksLikeCodeDocument(text: string): boolean {
 export function shouldTranslate(
   text: string,
   target: TranslationLanguage,
-  // 保留该参数以兼容调用方：规则只在真正翻译时生效，不参与是否翻译的判断。
-  _translationRules: string,
 ): boolean {
   const trimmed = text.trim()
   if (trimmed.length === 0) return false
